@@ -33,6 +33,38 @@ go test -v -short ./test
 | `TestSecureAcceleratorAccess` | Secure Accelerator Access | MUST |
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
+| `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | MUST |
+
+### Workload Sandboxing
+
+The workload sandboxing test (`TestWorkloadSandboxing`) verifies that the platform provides a sandboxing mechanism (such as standard Kubernetes `RuntimeClass` resources like `gvisor`, `kata`, or controllers like [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox)) that isolates untrusted workload execution from the host node kernel, process, memory, filesystem, and network namespaces.
+
+The test defaults to auto-detection (`-sandbox-type=auto`):
+1. If `-sandbox-runtime-class` is provided, it verifies and uses that `RuntimeClass`.
+2. Otherwise, it detects available sandboxed `RuntimeClass` objects (e.g., `gvisor`, `runsc`, `kata`, `sandboxed`, `quark`, `krun`) or the `agents.x-k8s.io` API group.
+3. If no sandboxing mechanism is detected and no flag is set, the test is skipped with guidance on configuring flags or opting out if the capability is N/A.
+
+To run with an explicit RuntimeClass:
+```bash
+go test -v ./test \
+  -run TestWorkloadSandboxing \
+  -sandbox-runtime-class=gvisor
+```
+
+To run with agent-sandbox:
+```bash
+go test -v ./test \
+  -run TestWorkloadSandboxing \
+  -sandbox-type=agent-sandbox
+```
+
+The test executes subtests verifying observable isolation boundaries:
+- `SchedulingAndExecution`: The sandboxed workload successfully schedules and executes within the designated sandbox runtime.
+- `ProcessIsolation`: Host processes (e.g., `kubelet`, `containerd`) are not visible and the PID namespace is strictly container-scoped.
+- `KernelAndMemoryIsolation`: Host physical/kernel memory access (`/dev/mem`, `/dev/kmem`) is restricted.
+- `FilesystemIsolation`: Host filesystem paths are not mounted into the sandbox.
+- `NetworkIsolation`: The sandboxed workload is restricted to its own network namespace, preventing access to host network interfaces and host loopback.
+
 
 ### Accelerator Cluster Autoscaling
 
