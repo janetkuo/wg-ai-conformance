@@ -432,17 +432,23 @@ func TestSandboxProbeScriptStructure(t *testing.T) {
 		"SANDBOX_PROBE: FS_ISOLATION=PASS",
 		"SANDBOX_PROBE: NET_ISOLATION=PASS",
 		sandboxProbeCompletedMarker,
-		"/proc/[0-9]*/cmdline",
+		"/proc/[0-9]*/comm",
 		"/proc/sys/kernel/random/boot_id",
 		"/dev/mem",
 		"/dev/kmem",
 		"/etc/kubernetes",
-		"/sys/class/net",
+		"/proc/net/dev",
 	}
 
 	for _, marker := range requiredMarkers {
 		if !strings.Contains(script, marker) {
 			t.Errorf("Probe script missing required check marker: %q", marker)
 		}
+	}
+
+	// The script is PID 1's cmdline inside the container, so the PID check
+	// must never grep cmdline for the daemon names or it matches itself.
+	if strings.Contains(script, "/proc/[0-9]*/cmdline") {
+		t.Errorf("Probe script inspects /proc/*/cmdline; the daemon-name pattern would match the probe's own command line")
 	}
 }

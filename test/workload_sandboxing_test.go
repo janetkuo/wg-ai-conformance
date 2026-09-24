@@ -613,17 +613,19 @@ echo "SANDBOX_INFO: KERNEL_RELEASE=$(uname -r 2>/dev/null || echo unknown)"
 echo "SANDBOX_INFO: KERNEL_VERSION=$(cat /proc/version 2>/dev/null || echo unknown)"
 echo "SANDBOX_INFO: BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
-# 1. PID Isolation: check visible process count and ensure no host daemons
+# 1. PID Isolation: check visible process count and ensure no host daemons.
+# Match on comm (the executable name) rather than cmdline: this script is
+# PID 1's cmdline, so grepping cmdline for the daemon names matches itself.
 pid_pass=1
 pid_count=0
 if [ -d /proc ]; then
   pid_count=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)
-  for p in /proc/[0-9]*/cmdline /proc/[0-9]*/comm; do
+  for p in /proc/[0-9]*/comm; do
     [ -f "$p" ] || continue
-    if grep -q -E "(kubelet|containerd|dockerd|systemd-journald|crio)" "$p" 2>/dev/null; then
-      pid_pass=0
-      break
-    fi
+    read -r comm < "$p" 2>/dev/null || continue
+    case "$comm" in
+      kubelet|containerd|containerd-shim*|dockerd|crio|systemd-journal) pid_pass=0 ;;
+    esac
   done
 fi
 echo "SANDBOX_INFO: PID_COUNT=$pid_count"
@@ -660,19 +662,21 @@ else
   echo "SANDBOX_PROBE: FS_ISOLATION=FAIL"
 fi
 
-# 4. Network Isolation: ensure host interfaces/bridges are not present
+# 4. Network Isolation: ensure host interfaces/bridges are not present.
+# Prefer /proc/net/dev: sandboxes with a minimal sysfs (gVisor) do not
+# populate /sys/class/net.
 net_pass=1
 iface_list=""
-if [ -d /sys/class/net ]; then
-  for iface in /sys/class/net/*; do
-    [ -e "$iface" ] || continue
-    b=$(basename "$iface")
-    iface_list="$iface_list $b"
-    case "$b" in
-      docker0|cbr0|flannel*|cni0|br-*|bond*|dummy*) net_pass=0 ;;
-    esac
-  done
+if [ -r /proc/net/dev ]; then
+  iface_list=$(awk -F: 'NR > 2 { gsub(/ /, "", $1); printf "%s ", $1 }' /proc/net/dev 2>/dev/null)
+elif [ -d /sys/class/net ]; then
+  iface_list=$(ls /sys/class/net 2>/dev/null | tr '\n' ' ')
 fi
+for b in $iface_list; do
+  case "$b" in
+    docker0|cbr0|flannel*|cni0|br-*|bond*|dummy*) net_pass=0 ;;
+  esac
+done
 echo "SANDBOX_INFO: INTERFACES=$iface_list"
 if [ "$net_pass" -eq 1 ]; then
   echo "SANDBOX_PROBE: NET_ISOLATION=PASS"
