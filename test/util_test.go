@@ -324,12 +324,33 @@ func checkDRAUsable(ctx context.Context, c kubernetes.Interface, cfg Accelerator
 		return "", err
 	}
 
-	// Consumers must ignore ResourceSlices whose pool generation is below the
-	// highest observed generation for that pool (older slices can linger
-	// with stale devices during a multi-slice pool update), and must treat a
-	// pool as unusable until all of its slices at that generation have been
-	// observed — ResourceSliceCount exists for exactly this check, and the
-	// scheduler's allocator ignores incomplete pools.
+	sawDriverSlice := false
+	for _, slice := range completePoolSlices(slices.Items, cfg.DRADriver) {
+		if allocatableDeviceCount(slice) == 0 {
+			continue
+		}
+		sawDriverSlice = true
+		node, ok := sliceEligibleNode(slice, usable, cfg)
+		if !ok {
+			continue
+		}
+		logf("Checking environment: Found ResourceSlice: %s (Node: %s, Driver: %s, Devices: %d)", slice.Name, node, slice.Spec.Driver, len(slice.Spec.Devices))
+		return node, nil
+	}
+	if sawDriverSlice {
+		return "", fmt.Errorf("ResourceSlices for driver %s exist, but none is reachable from a Ready, schedulable node", cfg.DRADriver)
+	}
+	return "", fmt.Errorf("no complete current-generation ResourceSlice with allocatable devices found for driver %s", cfg.DRADriver)
+}
+
+// completePoolSlices returns the ResourceSlices of driver that consumers may
+// rely on. Consumers must ignore ResourceSlices whose pool generation is below
+// the highest observed generation for that pool (older slices can linger with
+// stale devices during a multi-slice pool update), and must treat a pool as
+// unusable until all of its slices at that generation have been observed —
+// ResourceSliceCount exists for exactly this check, and the scheduler's
+// allocator ignores incomplete pools. Order is preserved.
+func completePoolSlices(slices []resourcev1.ResourceSlice, driver string) []*resourcev1.ResourceSlice {
 	type poolInfo struct {
 		generation int64
 		expected   int64
@@ -337,8 +358,8 @@ func checkDRAUsable(ctx context.Context, c kubernetes.Interface, cfg Accelerator
 		consistent bool
 	}
 	pools := make(map[string]*poolInfo)
-	for _, slice := range slices.Items {
-		if slice.Spec.Driver != cfg.DRADriver {
+	for _, slice := range slices {
+		if slice.Spec.Driver != driver {
 			continue
 		}
 		p, ok := pools[slice.Spec.Pool.Name]
@@ -358,31 +379,20 @@ func checkDRAUsable(ctx context.Context, c kubernetes.Interface, cfg Accelerator
 			}
 		}
 	}
-	poolUsable := func(name string) bool {
-		p := pools[name]
-		return p != nil && p.consistent && p.expected > 0 && p.observed == p.expected
-	}
 
-	sawDriverSlice := false
-	for _, slice := range slices.Items {
-		if slice.Spec.Driver != cfg.DRADriver ||
-			slice.Spec.Pool.Generation < pools[slice.Spec.Pool.Name].generation ||
-			!poolUsable(slice.Spec.Pool.Name) ||
-			allocatableDeviceCount(&slice) == 0 {
+	var complete []*resourcev1.ResourceSlice
+	for i := range slices {
+		slice := &slices[i]
+		if slice.Spec.Driver != driver {
 			continue
 		}
-		sawDriverSlice = true
-		node, ok := sliceEligibleNode(&slice, usable, cfg)
-		if !ok {
+		p := pools[slice.Spec.Pool.Name]
+		if slice.Spec.Pool.Generation < p.generation || !p.consistent || p.expected <= 0 || p.observed != p.expected {
 			continue
 		}
-		logf("Checking environment: Found ResourceSlice: %s (Node: %s, Driver: %s, Devices: %d)", slice.Name, node, slice.Spec.Driver, len(slice.Spec.Devices))
-		return node, nil
+		complete = append(complete, slice)
 	}
-	if sawDriverSlice {
-		return "", fmt.Errorf("ResourceSlices for driver %s exist, but none is reachable from a Ready, schedulable node", cfg.DRADriver)
-	}
-	return "", fmt.Errorf("no complete current-generation ResourceSlice with allocatable devices found for driver %s", cfg.DRADriver)
+	return complete
 }
 
 // allocatableDeviceCount counts a slice's devices that the test's
@@ -428,19 +438,26 @@ func sliceEligibleNode(slice *resourcev1.ResourceSlice, usable map[string]corev1
 			if deviceTaintBlocked(&device) {
 				continue
 			}
-			switch {
-			case device.NodeName != nil:
-				if _, ok := usable[*device.NodeName]; ok {
-					return *device.NodeName, true
-				}
-			case device.NodeSelector != nil:
-				if node, ok := firstNodeMatchingSelector(device.NodeSelector, usable, cfg); ok {
-					return node, true
-				}
-			case device.AllNodes != nil && *device.AllNodes:
-				return firstUsableNode(usable, cfg)
+			if node, ok := deviceEligibleNode(&device, usable, cfg); ok {
+				return node, true
 			}
 		}
+	}
+	return "", false
+}
+
+// deviceEligibleNode resolves a device's own node topology (set when its
+// slice uses perDeviceNodeSelection) against the usable nodes.
+func deviceEligibleNode(device *resourcev1.Device, usable map[string]corev1.Node, cfg AcceleratorConfig) (string, bool) {
+	switch {
+	case device.NodeName != nil:
+		if _, ok := usable[*device.NodeName]; ok {
+			return *device.NodeName, true
+		}
+	case device.NodeSelector != nil:
+		return firstNodeMatchingSelector(device.NodeSelector, usable, cfg)
+	case device.AllNodes != nil && *device.AllNodes:
+		return firstUsableNode(usable, cfg)
 	}
 	return "", false
 }
