@@ -19,9 +19,9 @@ The Kubernetes community has actively invested in tooling and runtimes for these
 - [x] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
 
 **MUST**
-- [x] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
-- [x] Demonstrate at least two real-world usage of SHOULD before graduating to MUST (e.g., Kata Containers, gVisor)
-- [x] Kubernetes core APIs must be GA
+- [ ] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
+- [ ] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
+- [ ] Kubernetes core APIs must be GA
 
 ## Test Plan
 
@@ -44,11 +44,12 @@ Validate the following observable outcomes by configuring a sandboxed `RuntimeCl
 The automated conformance test (`TestWorkloadSandboxing`) in `test/workload_sandboxing_test.go` verifies the observable outcomes above:
 1. Detects or accepts a sandboxed runtime solution (standard Kubernetes `RuntimeClass` such as `gvisor` or `kata`, or a sandboxing controller such as [`agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox)).
 2. Provisions a verification workload with the sandboxed runtime and executes probing checks confirming process, memory, filesystem, and network isolation from the host node.
-3. If a platform employs a specialized or unrecognized sandboxing mechanism that cannot be automatically verified, the test suite can be configured using `-sandbox-runtime-class=<name>` or skipped with guidance for manual attestation.
+3. Runs the same probe in an unsandboxed control pod pinned to the node the sandboxed workload landed on, and requires the sandboxed workload to observe a distinct kernel identity (kernel release, `/proc/version`, boot ID). A plain container passes the isolation probes on its own because it already has its own namespaces; only a runtime with a kernel boundary (a user-space kernel such as gVisor, or a microVM guest kernel such as Kata) reports a kernel distinct from the host.
+4. If a platform employs a specialized or unrecognized sandboxing mechanism, the test can be pointed at it with `-sandbox-runtime-class=<name>`; if no mechanism is detected and none is specified, the test is skipped with guidance for manual attestation.
 
 ## Implementation History
 
 - 2026-05-20: KAR created
-- 2026-09-10: Automated conformance test `TestWorkloadSandboxing` added to test suite and graduated to MUST
+- 2026-09-24: Automated conformance test `TestWorkloadSandboxing` added to the test suite
 
 ## Related KARs

@@ -6,8 +6,7 @@ participating-sigs:
   - sig-node
 status: implementable
 creation-date: "2026-05-20"
-stage: must
-latest-milestone: "v1.38"
+stage: should
+latest-milestone: "v1.37"
 milestone:
   should: "v1.37"
-  must: "v1.38"

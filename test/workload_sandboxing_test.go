@@ -20,7 +20,17 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
+)
+
+const (
+	sandboxTypeAuto         = "auto"
+	sandboxTypeRuntimeClass = "runtimeclass"
+	sandboxTypeAgentSandbox = "agent-sandbox"
+
+	agentSandboxAPIGroup = "agents.x-k8s.io"
+
+	sandboxProbeContainer       = "prober"
+	sandboxProbeCompletedMarker = "SANDBOX_PROBE: COMPLETED"
 )
 
 var (
@@ -30,39 +40,48 @@ var (
 	sandboxNamespace    *string
 	sandboxTimeout      *time.Duration
 
-	ErrNoSandboxingSolution = errors.New("no sandboxing solution (RuntimeClass or agent-sandbox) detected")
+	errNoSandboxingSolution = errors.New("no sandboxing solution (RuntimeClass or agent-sandbox) detected")
 )
 
 func init() {
 	sandboxRuntimeClass = flag.String("sandbox-runtime-class", "",
 		"Name of the RuntimeClass configured for workload sandboxing (e.g. gvisor, kata, runsc). If empty, auto-detection will be performed.")
-	sandboxType = flag.String("sandbox-type", "auto",
+	sandboxType = flag.String("sandbox-type", sandboxTypeAuto,
 		"Type of sandboxing solution to test: 'auto' (detect RuntimeClass or agent-sandbox), 'runtimeclass', or 'agent-sandbox'.")
 	sandboxImage = flag.String("sandbox-image", "busybox",
 		"Container image used for executing the sandboxing isolation probe.")
 	sandboxNamespace = flag.String("sandbox-namespace", "",
 		"Namespace for sandboxing test execution. If empty, a temporary namespace is generated and cleaned up.")
 	sandboxTimeout = flag.Duration("sandbox-timeout", 3*time.Minute,
-		"Timeout for the sandboxed workload to schedule and complete probing.")
+		"Timeout for each step of the sandboxing test: the sandboxed workload (and its unsandboxed control pod) reaching Running, and the probe script completing.")
 }
 
-// SandboxingSolution represents a resolved sandboxing mechanism to test.
-type SandboxingSolution struct {
-	SolutionType     string // "runtimeclass" or "agent-sandbox"
+// sandboxingSolution represents a resolved sandboxing mechanism to test.
+type sandboxingSolution struct {
+	SolutionType     string // sandboxTypeRuntimeClass or sandboxTypeAgentSandbox
 	RuntimeClassName string
 	Handler          string
 	AgentSandboxGVR  *schema.GroupVersionResource
 }
 
-// SandboxProbeResults captures parsed output from the sandbox isolation probe script.
-type SandboxProbeResults struct {
+// kernelIdentity is what a workload observes about the kernel it runs on. A
+// sandbox with its own kernel (gVisor's sentry, a Kata guest VM) reports a
+// different identity than a plain container sharing the host kernel.
+type kernelIdentity struct {
+	Release string // uname -r
+	Version string // /proc/version
+	BootID  string // /proc/sys/kernel/random/boot_id
+}
+
+// sandboxProbeResults captures parsed output from the sandbox isolation probe script.
+type sandboxProbeResults struct {
 	SchedulingPassed      bool
 	PidIsolationPassed    bool
 	KernelIsolationPassed bool
 	FsIsolationPassed     bool
 	NetIsolationPassed    bool
 	ProbeCompleted        bool
-	KernelInfo            string
+	Kernel                kernelIdentity
 	Interfaces            string
 	PidCount              int
 	RawLogs               string
@@ -73,6 +92,12 @@ type SandboxProbeResults struct {
 // Kubernetes RuntimeClass such as gVisor, Kata, or an agent-sandbox solution)
 // that isolates untrusted workload execution from the host node kernel, process,
 // filesystem, and network namespaces.
+//
+// The isolation probes alone cannot tell a sandbox from a plain runc container
+// (a runc pod also has its own PID and network namespaces and no /dev/mem), so
+// the test additionally runs the same probe in an unsandboxed control pod
+// pinned to the node the sandboxed workload landed on and requires the two
+// to observe different kernel identities.
 // Ref: https://github.com/kubernetes-sigs/ai-conformance/tree/main/kars/0020-workload-sandboxing
 func TestWorkloadSandboxing(t *testing.T) {
 	if testing.Short() {
@@ -83,12 +108,11 @@ func TestWorkloadSandboxing(t *testing.T) {
 	}
 
 	clientset := getClientset(t)
-	dynamicClient := getDynamicClient(t)
 
 	ctx := context.Background()
-	solution, err := discoverSandboxingSolution(ctx, clientset, dynamicClient, *sandboxType, *sandboxRuntimeClass, t.Logf)
+	solution, err := discoverSandboxingSolution(ctx, clientset, *sandboxType, *sandboxRuntimeClass, t.Logf)
 	if err != nil {
-		if errors.Is(err, ErrNoSandboxingSolution) {
+		if errors.Is(err, errNoSandboxingSolution) {
 			t.Skipf("Skipping workload sandboxing test: %v. Specify -sandbox-runtime-class or -sandbox-type to run. Platforms where workload sandboxing is not supported may leave these flags unset to opt out.", err)
 		}
 		t.Fatalf("Failed to resolve sandboxing solution: %v", err)
@@ -98,38 +122,29 @@ func TestWorkloadSandboxing(t *testing.T) {
 		solution.SolutionType, solution.RuntimeClassName, solution.Handler)
 
 	namespace := *sandboxNamespace
-	cleanupNamespace := false
 	if namespace == "" {
 		namespace = randomNamespaceName("sandbox-conformance")
-		cleanupNamespace = true
 		if _, err := clientset.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 			t.Fatalf("Failed to create namespace %s: %v", namespace, err)
 		}
-	}
-
-	t.Cleanup(func() {
-		if cleanupNamespace {
+		t.Cleanup(func() {
 			if err := deleteNamespaceAndWait(ctx, t, clientset, namespace); err != nil {
 				t.Errorf("CLEANUP FAILURE: Failed to delete namespace %s: %v", namespace, err)
 			}
-		}
-	})
-
-	var probePodName string
-	if solution.SolutionType == "runtimeclass" {
-		podName := "sandboxed-probe-pod"
-		probePodName = podName
-		pod := buildSandboxedPod(namespace, podName, solution.RuntimeClassName, *sandboxImage)
-		t.Cleanup(func() {
-			deletePolicy := metav1.DeletePropagationBackground
-			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 		})
+	}
 
-		t.Logf("Creating sandboxed pod %s/%s with RuntimeClass %q...", namespace, podName, solution.RuntimeClassName)
-		if _, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-			t.Fatalf("Failed to create sandboxed pod %s: %v", podName, err)
-		}
-	} else if solution.SolutionType == "agent-sandbox" {
+	// Sandboxed workload.
+	var sandboxedPodName string
+	switch solution.SolutionType {
+	case sandboxTypeRuntimeClass:
+		sandboxedPodName = "sandboxed-probe-pod"
+		pod := buildProbePod(namespace, sandboxedPodName, solution.RuntimeClassName, "", *sandboxImage)
+		t.Cleanup(func() { deletePodInBackground(ctx, clientset, namespace, sandboxedPodName) })
+		t.Logf("Creating sandboxed pod %s/%s with RuntimeClass %q...", namespace, sandboxedPodName, solution.RuntimeClassName)
+		createTestPod(ctx, t, clientset, pod)
+	case sandboxTypeAgentSandbox:
+		dynamicClient := getDynamicClient(t)
 		sandboxName := "sandboxed-probe-cr"
 		t.Cleanup(func() {
 			deletePolicy := metav1.DeletePropagationBackground
@@ -142,67 +157,81 @@ func TestWorkloadSandboxing(t *testing.T) {
 			t.Fatalf("Failed to create agent-sandbox resource %s: %v", sandboxName, err)
 		}
 
-		podName, err := waitForAgentSandboxPod(ctx, clientset, namespace, sandboxName, *sandboxTimeout)
+		sandboxedPodName, err = waitForAgentSandboxPod(ctx, clientset, namespace, sandboxName, *sandboxTimeout)
 		if err != nil {
 			t.Fatalf("Failed to find Pod created by agent-sandbox %s: %v", sandboxName, err)
 		}
-		probePodName = podName
+	default:
+		t.Fatalf("BUG: unknown sandboxing solution type %q", solution.SolutionType)
 	}
 
-	t.Logf("Waiting for probe pod %s to reach Running phase...", probePodName)
-	runningPods, err := waitForPodsRunning(ctx, clientset, namespace, []string{probePodName}, *sandboxTimeout)
+	sandboxedPod := waitForProbePodRunning(ctx, t, clientset, namespace, sandboxedPodName)
+	sandboxNode := sandboxedPod.Spec.NodeName
+	t.Logf("Sandboxed pod %s is Running on node %s", sandboxedPodName, sandboxNode)
+
+	sandboxedLogs, err := waitForProbeCompletion(ctx, clientset, namespace, sandboxedPodName, *sandboxTimeout)
 	if err != nil {
-		pod, getErr := clientset.CoreV1().Pods(namespace).Get(ctx, probePodName, metav1.GetOptions{})
-		phase := "unknown"
-		if getErr == nil {
-			phase = string(pod.Status.Phase)
-		}
-		t.Fatalf("Probe pod %s failed to reach Running phase within %v (current phase: %s): %v", probePodName, *sandboxTimeout, phase, err)
+		t.Fatalf("Sandboxed workload probe did not complete: %v", err)
 	}
+	sandboxed := parseProbeLogs(sandboxedLogs)
 
-	runningPod := runningPods[probePodName]
-	t.Logf("Probe pod %s is Running on node %s", probePodName, runningPod.Spec.NodeName)
+	// Unsandboxed control pod on the same node. It is pinned with
+	// spec.nodeName (bypassing the scheduler, so NoSchedule taints on a
+	// dedicated sandbox node pool do not block it); it requests no
+	// accelerators, so bypassing the scheduler is safe here.
+	controlPodName := "unsandboxed-control-pod"
+	controlPod := buildProbePod(namespace, controlPodName, "", sandboxNode, *sandboxImage)
+	t.Cleanup(func() { deletePodInBackground(ctx, clientset, namespace, controlPodName) })
+	t.Logf("Creating unsandboxed control pod %s/%s on node %s...", namespace, controlPodName, sandboxNode)
+	createTestPod(ctx, t, clientset, controlPod)
+	waitForProbePodRunning(ctx, t, clientset, namespace, controlPodName)
 
-	rawLogs, err := fetchPodLogsWithRetry(ctx, clientset, namespace, probePodName, "prober", 30*time.Second)
+	controlLogs, err := waitForProbeCompletion(ctx, clientset, namespace, controlPodName, *sandboxTimeout)
 	if err != nil {
-		t.Fatalf("Failed to retrieve logs from probe pod %s: %v", probePodName, err)
+		t.Fatalf("Control pod probe did not complete: %v", err)
 	}
-
-	results := parseProbeLogs(rawLogs)
+	control := parseProbeLogs(controlLogs)
+	t.Logf("Kernel identity: sandboxed=%+v control=%+v", sandboxed.Kernel, control.Kernel)
 
 	t.Run("SchedulingAndExecution", func(t *testing.T) {
-		if !results.SchedulingPassed {
-			t.Fatalf("Sandboxed workload failed to schedule or execute. Raw logs:\n%s", rawLogs)
+		if !sandboxed.SchedulingPassed || !sandboxed.ProbeCompleted {
+			t.Fatalf("Sandboxed workload failed to schedule or execute the probe to completion. Raw logs:\n%s", sandboxedLogs)
 		}
-		t.Logf("PASS: Sandboxed workload successfully scheduled and executed (Kernel: %s)", results.KernelInfo)
+		t.Logf("PASS: Sandboxed workload scheduled and executed on node %s (kernel release: %s)", sandboxNode, sandboxed.Kernel.Release)
 	})
 
 	t.Run("ProcessIsolation", func(t *testing.T) {
-		if !results.PidIsolationPassed {
-			t.Fatalf("Process isolation check failed: host processes detected or PID namespace leaked. Raw logs:\n%s", rawLogs)
+		if !sandboxed.PidIsolationPassed {
+			t.Fatalf("Process isolation check failed: host processes detected or PID namespace leaked. Raw logs:\n%s", sandboxedLogs)
 		}
-		t.Logf("PASS: Process isolation verified (Visible PIDs: %d)", results.PidCount)
+		t.Logf("PASS: Process isolation verified (visible PIDs: %d)", sandboxed.PidCount)
 	})
 
 	t.Run("KernelAndMemoryIsolation", func(t *testing.T) {
-		if !results.KernelIsolationPassed {
-			t.Fatalf("Kernel/memory isolation check failed: direct host memory or kernel interface access was permitted. Raw logs:\n%s", rawLogs)
+		if !sandboxed.KernelIsolationPassed {
+			t.Fatalf("Kernel/memory isolation check failed: direct host memory or kernel interface access was permitted. Raw logs:\n%s", sandboxedLogs)
 		}
-		t.Logf("PASS: Kernel and memory isolation boundary verified")
+		differs, fields := kernelIdentitiesDiffer(sandboxed.Kernel, control.Kernel)
+		if !differs {
+			t.Fatalf("Sandboxed workload observes the same kernel identity as an unsandboxed pod on node %s (%+v). "+
+				"The runtime handler %q does not appear to provide a kernel boundary; a sandbox such as gVisor or Kata exposes a guest kernel distinct from the host. "+
+				"Sandboxed logs:\n%s\nControl logs:\n%s", sandboxNode, sandboxed.Kernel, solution.Handler, sandboxedLogs, controlLogs)
+		}
+		t.Logf("PASS: Kernel and memory isolation boundary verified (kernel identity differs from host in: %s)", strings.Join(fields, ", "))
 	})
 
 	t.Run("FilesystemIsolation", func(t *testing.T) {
-		if !results.FsIsolationPassed {
-			t.Fatalf("Filesystem isolation check failed: host filesystem paths accessible. Raw logs:\n%s", rawLogs)
+		if !sandboxed.FsIsolationPassed {
+			t.Fatalf("Filesystem isolation check failed: host filesystem paths accessible. Raw logs:\n%s", sandboxedLogs)
 		}
 		t.Logf("PASS: Filesystem isolation boundary verified")
 	})
 
 	t.Run("NetworkIsolation", func(t *testing.T) {
-		if !results.NetIsolationPassed {
-			t.Fatalf("Network isolation check failed: host network interfaces detected in sandbox. Raw logs:\n%s", rawLogs)
+		if !sandboxed.NetIsolationPassed {
+			t.Fatalf("Network isolation check failed: host network interfaces detected in sandbox. Raw logs:\n%s", sandboxedLogs)
 		}
-		t.Logf("PASS: Network namespace isolation verified (Interfaces: %s)", results.Interfaces)
+		t.Logf("PASS: Network namespace isolation verified (interfaces: %s)", sandboxed.Interfaces)
 	})
 }
 
@@ -210,17 +239,16 @@ func TestWorkloadSandboxing(t *testing.T) {
 func discoverSandboxingSolution(
 	ctx context.Context,
 	clientset kubernetes.Interface,
-	dynamicClient dynamic.Interface,
 	requestedType string,
 	requestedClass string,
 	logf func(string, ...any),
-) (*SandboxingSolution, error) {
+) (*sandboxingSolution, error) {
 	switch requestedType {
-	case "runtimeclass":
+	case sandboxTypeRuntimeClass:
 		return resolveRuntimeClassSolution(ctx, clientset, requestedClass, logf)
-	case "agent-sandbox":
+	case sandboxTypeAgentSandbox:
 		return resolveAgentSandboxSolution(ctx, clientset, requestedClass, logf)
-	case "auto":
+	case sandboxTypeAuto:
 		if requestedClass != "" {
 			return resolveRuntimeClassSolution(ctx, clientset, requestedClass, logf)
 		}
@@ -230,22 +258,22 @@ func discoverSandboxingSolution(
 		if sol, err := resolveAgentSandboxSolution(ctx, clientset, "", logf); err == nil {
 			return sol, nil
 		}
-		return nil, ErrNoSandboxingSolution
+		return nil, errNoSandboxingSolution
 	default:
-		return nil, fmt.Errorf("invalid -sandbox-type %q; supported types: 'auto', 'runtimeclass', 'agent-sandbox'", requestedType)
+		return nil, fmt.Errorf("invalid -sandbox-type %q; supported types: %q, %q, %q", requestedType, sandboxTypeAuto, sandboxTypeRuntimeClass, sandboxTypeAgentSandbox)
 	}
 }
 
 // resolveRuntimeClassSolution finds an appropriate RuntimeClass for sandboxing.
-func resolveRuntimeClassSolution(ctx context.Context, clientset kubernetes.Interface, requestedClass string, logf func(string, ...any)) (*SandboxingSolution, error) {
+func resolveRuntimeClassSolution(ctx context.Context, clientset kubernetes.Interface, requestedClass string, logf func(string, ...any)) (*sandboxingSolution, error) {
 	if requestedClass != "" {
 		rc, err := clientset.NodeV1().RuntimeClasses().Get(ctx, requestedClass, metav1.GetOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("specified RuntimeClass %q not found: %w", requestedClass, err)
 		}
 		logf("Found specified sandboxed RuntimeClass %q (handler: %s)", rc.Name, rc.Handler)
-		return &SandboxingSolution{
-			SolutionType:     "runtimeclass",
+		return &sandboxingSolution{
+			SolutionType:     sandboxTypeRuntimeClass,
 			RuntimeClassName: rc.Name,
 			Handler:          rc.Handler,
 		}, nil
@@ -259,8 +287,8 @@ func resolveRuntimeClassSolution(ctx context.Context, clientset kubernetes.Inter
 	for _, rc := range rcList.Items {
 		if isKnownSandboxedRuntime(&rc) {
 			logf("Discovered sandboxed RuntimeClass %q (handler: %s)", rc.Name, rc.Handler)
-			return &SandboxingSolution{
-				SolutionType:     "runtimeclass",
+			return &sandboxingSolution{
+				SolutionType:     sandboxTypeRuntimeClass,
 				RuntimeClassName: rc.Name,
 				Handler:          rc.Handler,
 			}, nil
@@ -270,38 +298,49 @@ func resolveRuntimeClassSolution(ctx context.Context, clientset kubernetes.Inter
 	return nil, errors.New("no known sandboxed RuntimeClass found")
 }
 
-// resolveAgentSandboxSolution checks for the kubernetes-sigs/agent-sandbox API group.
-func resolveAgentSandboxSolution(ctx context.Context, clientset kubernetes.Interface, requestedClass string, logf func(string, ...any)) (*SandboxingSolution, error) {
+// resolveAgentSandboxSolution checks for the kubernetes-sigs/agent-sandbox API
+// group. requestedClass, if set, is the RuntimeClass the Sandbox's Pod runs
+// with; agent-sandbox itself only orchestrates Pods and relies on the runtime
+// handler for kernel isolation.
+func resolveAgentSandboxSolution(ctx context.Context, clientset kubernetes.Interface, requestedClass string, logf func(string, ...any)) (*sandboxingSolution, error) {
 	groups, err := clientset.Discovery().ServerGroups()
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover server groups: %w", err)
 	}
 
-	var foundGV *schema.GroupVersion
+	version := ""
 	for _, g := range groups.Groups {
-		if g.Name == "agents.x-k8s.io" {
-			if len(g.Versions) > 0 {
-				foundGV = &schema.GroupVersion{Group: g.Name, Version: g.Versions[0].Version}
-				break
-			}
+		if g.Name != agentSandboxAPIGroup {
+			continue
 		}
+		version = g.PreferredVersion.Version
+		if version == "" && len(g.Versions) > 0 {
+			version = g.Versions[0].Version
+		}
+		break
 	}
-	if foundGV == nil {
-		return nil, errors.New("API group agents.x-k8s.io not found")
+	if version == "" {
+		return nil, fmt.Errorf("API group %s not found", agentSandboxAPIGroup)
 	}
 
-	gvr := schema.GroupVersionResource{
-		Group:    foundGV.Group,
-		Version:  foundGV.Version,
-		Resource: "sandboxes",
-	}
-
+	gvr := schema.GroupVersionResource{Group: agentSandboxAPIGroup, Version: version, Resource: "sandboxes"}
 	logf("Discovered agent-sandbox API %s", gvr.String())
-	return &SandboxingSolution{
-		SolutionType:     "agent-sandbox",
-		RuntimeClassName: requestedClass,
-		AgentSandboxGVR:  &gvr,
-	}, nil
+
+	sol := &sandboxingSolution{
+		SolutionType:    sandboxTypeAgentSandbox,
+		AgentSandboxGVR: &gvr,
+	}
+	if requestedClass == "" {
+		logf("WARNING: no -sandbox-runtime-class given; the Sandbox's Pod runs under the cluster's default runtime handler, which must itself provide a kernel boundary for the KernelAndMemoryIsolation subtest to pass")
+		return sol, nil
+	}
+	rc, err := clientset.NodeV1().RuntimeClasses().Get(ctx, requestedClass, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("specified RuntimeClass %q not found: %w", requestedClass, err)
+	}
+	sol.RuntimeClassName = rc.Name
+	sol.Handler = rc.Handler
+	return sol, nil
 }
 
 // isKnownSandboxedRuntime checks whether a RuntimeClass corresponds to known sandboxed runtimes.
@@ -318,7 +357,6 @@ func isKnownSandboxedRuntime(rc *nodev1.RuntimeClass) bool {
 		"kata",
 		"sandboxed",
 		"quark",
-		"crun-krun",
 		"krun",
 	}
 
@@ -330,8 +368,10 @@ func isKnownSandboxedRuntime(rc *nodev1.RuntimeClass) bool {
 	return false
 }
 
-// buildSandboxedPod constructs a Pod with the specified runtime class and isolation prober.
-func buildSandboxedPod(ns, name, runtimeClassName, image string) *corev1.Pod {
+// buildProbePod constructs a Pod running the isolation prober. runtimeClassName
+// selects the sandbox (empty for a plain, unsandboxed pod); nodeName, if set,
+// pins the pod to a node.
+func buildProbePod(ns, name, runtimeClassName, nodeName, image string) *corev1.Pod {
 	var rcName *string
 	if runtimeClassName != "" {
 		rcName = &runtimeClassName
@@ -346,24 +386,27 @@ func buildSandboxedPod(ns, name, runtimeClassName, image string) *corev1.Pod {
 		},
 		Spec: corev1.PodSpec{
 			RuntimeClassName: rcName,
+			NodeName:         nodeName,
 			RestartPolicy:    corev1.RestartPolicyNever,
-			Containers: []corev1.Container{
-				{
-					Name:    "prober",
-					Image:   image,
-					Command: []string{"/bin/sh", "-c"},
-					Args:    []string{sandboxProbeScript() + "\nsleep 3600"},
-					Resources: corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("50m"),
-							corev1.ResourceMemory: resource.MustParse("64Mi"),
-						},
-						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("200m"),
-							corev1.ResourceMemory: resource.MustParse("128Mi"),
-						},
-					},
-				},
+			Containers:       []corev1.Container{sandboxProbeContainerSpec(image)},
+		},
+	}
+}
+
+func sandboxProbeContainerSpec(image string) corev1.Container {
+	return corev1.Container{
+		Name:    sandboxProbeContainer,
+		Image:   image,
+		Command: []string{"/bin/sh", "-c"},
+		Args:    []string{sandboxProbeScript() + "\nsleep 3600"},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("50m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		},
 	}
@@ -375,7 +418,7 @@ func buildAgentSandboxCR(ns, name string, gvr schema.GroupVersionResource, runti
 		"restartPolicy": "Never",
 		"containers": []interface{}{
 			map[string]interface{}{
-				"name":    "prober",
+				"name":    sandboxProbeContainer,
 				"image":   image,
 				"command": []interface{}{"/bin/sh", "-c"},
 				"args":    []interface{}{sandboxProbeScript() + "\nsleep 3600"},
@@ -409,6 +452,11 @@ func buildAgentSandboxCR(ns, name string, gvr schema.GroupVersionResource, runti
 			},
 			"spec": map[string]interface{}{
 				"podTemplate": map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"labels": map[string]interface{}{
+							"ai-conformance.kubernetes.io/test": "workload-sandboxing",
+						},
+					},
 					"spec": podSpec,
 				},
 			},
@@ -416,57 +464,102 @@ func buildAgentSandboxCR(ns, name string, gvr schema.GroupVersionResource, runti
 	}
 }
 
-// waitForAgentSandboxPod locates the Pod spawned by an agent-sandbox CR.
+// waitForAgentSandboxPod locates the Pod owned by an agent-sandbox Sandbox.
 func waitForAgentSandboxPod(ctx context.Context, c kubernetes.Interface, ns, sandboxName string, timeout time.Duration) (string, error) {
 	var podName string
+	var lastAPIError error
 	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		pods, err := c.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
+			lastAPIError = err
+			if isRetryableAPIError(err) {
+				return false, nil
+			}
 			return false, err
 		}
+		lastAPIError = nil
 		for _, p := range pods.Items {
 			for _, owner := range p.OwnerReferences {
-				if owner.Kind == "Sandbox" && owner.Name == sandboxName {
+				if owner.Kind == "Sandbox" && owner.Name == sandboxName && strings.HasPrefix(owner.APIVersion, agentSandboxAPIGroup+"/") {
 					podName = p.Name
 					return true, nil
 				}
-			}
-			if p.Labels["agents.x-k8s.io/sandbox-name"] == sandboxName || strings.HasPrefix(p.Name, sandboxName) {
-				podName = p.Name
-				return true, nil
 			}
 		}
 		return false, nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("timed out waiting for Pod created by Sandbox %s: %w", sandboxName, err)
+		return "", fmt.Errorf("no Pod owned by Sandbox %s appeared within %s%s: %w", sandboxName, timeout, lastAPIErrorSuffix(lastAPIError), err)
 	}
 	return podName, nil
 }
 
-// fetchPodLogsWithRetry reads logs from the prober container until the completion marker is observed.
-func fetchPodLogsWithRetry(ctx context.Context, c kubernetes.Interface, ns, podName, containerName string, timeout time.Duration) (string, error) {
+// waitForProbePodRunning waits for a probe pod to reach Running and returns it.
+func waitForProbePodRunning(ctx context.Context, t *testing.T, c kubernetes.Interface, ns, name string) *corev1.Pod {
+	t.Helper()
+	t.Logf("Waiting for pod %s to reach Running phase...", name)
+	running, err := waitForPodsRunning(ctx, c, ns, []string{name}, *sandboxTimeout)
+	if err != nil {
+		phase := "unknown"
+		if p, getErr := c.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{}); getErr == nil {
+			phase = string(p.Status.Phase)
+		}
+		t.Fatalf("Pod %s failed to reach Running phase within %v (current phase: %s): %v", name, *sandboxTimeout, phase, err)
+	}
+	return running[name]
+}
+
+// waitForProbeCompletion reads the prober container's logs until the
+// completion marker appears. On timeout it returns the partial logs along
+// with the error so the caller can surface them.
+func waitForProbeCompletion(ctx context.Context, c kubernetes.Interface, ns, podName string, timeout time.Duration) (string, error) {
 	var logs string
+	var lastAPIError error
 	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		rawLogs, err := c.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{Container: containerName}).DoRaw(ctx)
+		raw, err := c.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{Container: sandboxProbeContainer}).DoRaw(ctx)
 		if err != nil {
+			lastAPIError = err
 			return false, nil
 		}
-		logs = string(rawLogs)
-		if strings.Contains(logs, "SANDBOX_PROBE: COMPLETED") {
-			return true, nil
-		}
-		return false, nil
+		lastAPIError = nil
+		logs = string(raw)
+		return strings.Contains(logs, sandboxProbeCompletedMarker), nil
 	})
-	if err != nil && logs == "" {
-		return "", fmt.Errorf("failed to retrieve complete probe logs for pod %s: %w", podName, err)
+	if err != nil {
+		return logs, fmt.Errorf("probe in pod %s did not report %q within %s%s: %w\nPartial logs:\n%s",
+			podName, sandboxProbeCompletedMarker, timeout, lastAPIErrorSuffix(lastAPIError), err, logs)
 	}
 	return logs, nil
 }
 
+func deletePodInBackground(ctx context.Context, c kubernetes.Interface, ns, name string) {
+	deletePolicy := metav1.DeletePropagationBackground
+	_ = c.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
+}
+
+// kernelIdentitiesDiffer reports whether the sandboxed workload observed a
+// kernel identity distinct from the unsandboxed control pod, and which fields
+// differed. A field that either side could not read is ignored, so a runtime
+// that does not expose boot_id is judged on release and version alone.
+func kernelIdentitiesDiffer(sandboxed, control kernelIdentity) (bool, []string) {
+	var differing []string
+	compare := func(field, a, b string) {
+		if a == "" || b == "" {
+			return
+		}
+		if a != b {
+			differing = append(differing, field)
+		}
+	}
+	compare("release", sandboxed.Release, control.Release)
+	compare("version", sandboxed.Version, control.Version)
+	compare("boot_id", sandboxed.BootID, control.BootID)
+	return len(differing) > 0, differing
+}
+
 // parseProbeLogs parses the output of the sandbox probe script into structured results.
-func parseProbeLogs(logs string) *SandboxProbeResults {
-	res := &SandboxProbeResults{RawLogs: logs}
+func parseProbeLogs(logs string) *sandboxProbeResults {
+	res := &sandboxProbeResults{RawLogs: logs}
 	for _, line := range strings.Split(logs, "\n") {
 		line = strings.TrimSpace(line)
 		switch {
@@ -480,14 +573,18 @@ func parseProbeLogs(logs string) *SandboxProbeResults {
 			res.FsIsolationPassed = true
 		case line == "SANDBOX_PROBE: NET_ISOLATION=PASS":
 			res.NetIsolationPassed = true
-		case line == "SANDBOX_PROBE: COMPLETED":
+		case line == sandboxProbeCompletedMarker:
 			res.ProbeCompleted = true
-		case strings.HasPrefix(line, "SANDBOX_INFO: KERNEL="):
-			res.KernelInfo = strings.TrimPrefix(line, "SANDBOX_INFO: KERNEL=")
+		case strings.HasPrefix(line, "SANDBOX_INFO: KERNEL_RELEASE="):
+			res.Kernel.Release = probeInfoValue(line, "SANDBOX_INFO: KERNEL_RELEASE=")
+		case strings.HasPrefix(line, "SANDBOX_INFO: KERNEL_VERSION="):
+			res.Kernel.Version = probeInfoValue(line, "SANDBOX_INFO: KERNEL_VERSION=")
+		case strings.HasPrefix(line, "SANDBOX_INFO: BOOT_ID="):
+			res.Kernel.BootID = probeInfoValue(line, "SANDBOX_INFO: BOOT_ID=")
 		case strings.HasPrefix(line, "SANDBOX_INFO: INTERFACES="):
-			res.Interfaces = strings.TrimSpace(strings.TrimPrefix(line, "SANDBOX_INFO: INTERFACES="))
+			res.Interfaces = probeInfoValue(line, "SANDBOX_INFO: INTERFACES=")
 		case strings.HasPrefix(line, "SANDBOX_INFO: PID_COUNT="):
-			if count, err := strconv.Atoi(strings.TrimPrefix(line, "SANDBOX_INFO: PID_COUNT=")); err == nil {
+			if count, err := strconv.Atoi(probeInfoValue(line, "SANDBOX_INFO: PID_COUNT=")); err == nil {
 				res.PidCount = count
 			}
 		}
@@ -495,12 +592,26 @@ func parseProbeLogs(logs string) *SandboxProbeResults {
 	return res
 }
 
-// sandboxProbeScript returns the shell script executed inside the sandboxed container to probe isolation.
+// probeInfoValue extracts an info value; the script prints "unknown" for
+// values it could not read, which is normalized to "" (no information).
+func probeInfoValue(line, prefix string) string {
+	v := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	if v == "unknown" {
+		return ""
+	}
+	return v
+}
+
+// sandboxProbeScript returns the shell script executed inside the probe
+// container. The same script runs in the sandboxed workload and in the
+// unsandboxed control pod.
 func sandboxProbeScript() string {
-	return `count=0
-echo "SANDBOX_PROBE: SCHEDULING=PASS"
-uname_info=$(uname -a 2>/dev/null || cat /proc/version 2>/dev/null || echo "unknown")
-echo "SANDBOX_INFO: KERNEL=$uname_info"
+	return `echo "SANDBOX_PROBE: SCHEDULING=PASS"
+
+# 0. Kernel identity: a sandbox with its own kernel reports values distinct from the host.
+echo "SANDBOX_INFO: KERNEL_RELEASE=$(uname -r 2>/dev/null || echo unknown)"
+echo "SANDBOX_INFO: KERNEL_VERSION=$(cat /proc/version 2>/dev/null || echo unknown)"
+echo "SANDBOX_INFO: BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
 # 1. PID Isolation: check visible process count and ensure no host daemons
 pid_pass=1
@@ -569,22 +680,14 @@ else
   echo "SANDBOX_PROBE: NET_ISOLATION=FAIL"
 fi
 
-echo "SANDBOX_PROBE: COMPLETED"
+echo "` + sandboxProbeCompletedMarker + `"
 `
 }
 
 // getDynamicClient creates a dynamic Kubernetes client using the kubeconfig flag.
 func getDynamicClient(t *testing.T) dynamic.Interface {
 	t.Helper()
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if *kubeconfig != "" {
-		loadingRules.ExplicitPath = *kubeconfig
-	}
-	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{}).ClientConfig()
-	if err != nil {
-		t.Fatalf("Error building kubeconfig: %v", err)
-	}
-	dynamicClient, err := dynamic.NewForConfig(config)
+	dynamicClient, err := dynamic.NewForConfig(getRESTConfig(t))
 	if err != nil {
 		t.Fatalf("Error creating dynamic kubernetes client: %v", err)
 	}
