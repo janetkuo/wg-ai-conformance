@@ -46,6 +46,19 @@ type AcceleratorConfig struct {
 	// DevicePattern is a shell glob that matches allocatable accelerator
 	// device nodes while excluding auxiliary and control devices.
 	DevicePattern string
+	// DRADriverVersionAttributes lists candidate DRA Device.Attributes keys
+	// that expose the installed accelerator driver version on a ResourceSlice.
+	DRADriverVersionAttributes []string
+	// NodeDriverVersionLabels lists candidate Node label or annotation keys
+	// that expose the installed accelerator driver version when DRA is not used.
+	NodeDriverVersionLabels []string
+	// DriverProbeScript is a POSIX sh snippet that runs after
+	// acceleratorProbeCommand ($count holds the matched device count) inside
+	// an accelerator-requesting container built from a vanilla image. It must
+	// print the RESULT: RUNTIME_CONFIG_OK=, RESULT: DRIVER_FUNCTIONAL= and
+	// RESULT: ACTUAL_DRIVER_VERSION= lines consumed by
+	// parseDriverRuntimeProbeLogs.
+	DriverProbeScript string
 }
 
 // Allocation modes for granting accelerators to test pods. The conformance
@@ -76,6 +89,11 @@ var (
 			ExtendedResource: "nvidia.com/gpu",
 			TaintKey:         "nvidia.com/gpu",
 			DevicePattern:    "/dev/nvidia[0-9]*",
+			// Published by NVIDIA/k8s-dra-driver-gpu as a version attribute.
+			DRADriverVersionAttributes: []string{"driverVersion"},
+			// Published by NVIDIA GPU Feature Discovery.
+			NodeDriverVersionLabels: []string{"nvidia.com/cuda.driver-version.full"},
+			DriverProbeScript:       nvidiaDriverProbeScript,
 		},
 		// Add other vendors here
 	}
