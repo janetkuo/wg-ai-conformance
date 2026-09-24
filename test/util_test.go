@@ -43,6 +43,32 @@ type AcceleratorConfig struct {
 	// DevicePattern is a shell glob that matches allocatable accelerator
 	// device nodes while excluding auxiliary and control devices.
 	DevicePattern string
+	// DRADriverVersionAttributes lists candidate DRA Device.Attributes keys
+	// that expose the installed accelerator driver version on a ResourceSlice.
+	DRADriverVersionAttributes []string
+	// DRARuntimeVersionAttributes lists candidate DRA Device.Attributes keys
+	// that expose the accelerator runtime API version supported by the
+	// installed driver (e.g. the CUDA driver API version) on a ResourceSlice.
+	DRARuntimeVersionAttributes []string
+	// NodeDriverVersionLabels lists candidate Node label or annotation keys
+	// that expose the installed accelerator driver version when DRA is not used.
+	NodeDriverVersionLabels []string
+	// NodeRuntimeVersionLabels lists candidate Node label or annotation keys
+	// that expose the accelerator runtime API version when DRA is not used.
+	NodeRuntimeVersionLabels []string
+	// NodePresenceLabels lists candidate Node labels indicating accelerator
+	// discovery/driver readiness on nodes managed via device plugins.
+	NodePresenceLabels []string
+	// RuntimeClassNames lists candidate Kubernetes RuntimeClass names used to
+	// configure the container runtime for this accelerator.
+	RuntimeClassNames []string
+	// DriverProbeScript is a POSIX sh snippet that runs after
+	// acceleratorProbeCommand ($count holds the matched device count) inside
+	// an accelerator-requesting container built from a vanilla image. It must
+	// print the RESULT: RUNTIME_CONFIG_OK=, RESULT: DRIVER_FUNCTIONAL=,
+	// RESULT: ACTUAL_DRIVER_VERSION= and RESULT: ACTUAL_RUNTIME_VERSION= lines
+	// consumed by parseDriverRuntimeProbeLogs.
+	DriverProbeScript string
 }
 
 // Allocation modes for granting accelerators to test pods. The conformance
@@ -70,6 +96,34 @@ var (
 			ExtendedResource: "nvidia.com/gpu",
 			TaintKey:         "nvidia.com/gpu",
 			DevicePattern:    "/dev/nvidia[0-9]*",
+			DRADriverVersionAttributes: []string{
+				"driverVersion",
+				"gpu.nvidia.com/driverVersion",
+				"driver-version",
+			},
+			DRARuntimeVersionAttributes: []string{
+				"cudaDriverVersion",
+				"gpu.nvidia.com/cudaDriverVersion",
+				"cudaRuntimeVersion",
+				"runtimeVersion",
+			},
+			NodeDriverVersionLabels: []string{
+				"nvidia.com/cuda.driver-version.full",
+				"nvidia.com/cuda.driver.major",
+			},
+			NodeRuntimeVersionLabels: []string{
+				"nvidia.com/cuda.runtime-version.full",
+				"nvidia.com/cuda.runtime.major",
+			},
+			NodePresenceLabels: []string{
+				"nvidia.com/gpu.present",
+				"feature.node.kubernetes.io/pci-10de.present",
+			},
+			RuntimeClassNames: []string{
+				"nvidia",
+				"nvidia-cdi",
+			},
+			DriverProbeScript: nvidiaDriverProbeScript,
 		},
 		// Add other vendors here
 	}
