@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -54,6 +55,8 @@ const (
 	allocationModeDevicePlugin         = "device-plugin"
 	requestedAcceleratorCount    int64 = 1
 	acceleratorCountResultPrefix       = "RESULT: ACCELERATOR_COUNT="
+	acceleratorLogPollInterval         = 2 * time.Second
+	acceleratorLogPollTimeout          = 90 * time.Second
 )
 
 var (
@@ -840,28 +843,57 @@ func deleteAndAwaitRelease(ctx context.Context, c kubernetes.Interface, ns, name
 // device nodes by checking its logs.
 func verifyAcceleratorCountInLogs(ctx context.Context, t *testing.T, c kubernetes.Interface, ns, podName, containerName string, expectedCount int64) {
 	var logs string
-	pass := false
+	var lastLogErr error
 	expectedText := fmt.Sprintf("%s%d", acceleratorCountResultPrefix, expectedCount)
 	t.Logf("Waiting to see if Pod %s/%s logs contain '%s'...", podName, containerName, expectedText)
-	for i := 0; i < 2; i++ {
+	// The prober emits its result line right after it starts, but on a fresh
+	// cluster device/CDI setup or kubelet log lag can push that well past the
+	// pod reporting Running. Poll up to a bounded timeout instead of sampling
+	// a fixed window.
+	err := wait.PollUntilContextTimeout(ctx, acceleratorLogPollInterval, acceleratorLogPollTimeout, true, func(ctx context.Context) (bool, error) {
 		rawLogs, err := c.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{Container: containerName}).DoRaw(ctx)
-		if err == nil {
-			logs = string(rawLogs)
-			if logsContainExactLine(logs, expectedText) {
-				pass = true
-				break
-			}
+		if err != nil {
+			lastLogErr = err
+			return false, nil
 		}
-		time.Sleep(5 * time.Second)
+		lastLogErr = nil
+		logs = string(rawLogs)
+		return logsContainExactLine(logs, expectedText), nil
+	})
+	if err == nil {
+		t.Logf("PASS: %s sees exactly %d accelerator device(s).", containerName, expectedCount)
+		return
 	}
 
-	if pass {
-		t.Logf("PASS: %s sees exactly %d accelerator device(s).", containerName, expectedCount)
-	} else if expectedCount > 0 {
-		t.Errorf("FAIL: Container %s in Pod %s should see exactly %d accelerator device(s). Logs: %s", containerName, podName, expectedCount, logs)
+	// Include the container's status so an empty log is distinguishable from
+	// a prober that crashed or never started.
+	detail := fmt.Sprintf("not seen within %s; containerStatus=%s%s",
+		acceleratorLogPollTimeout, containerStatusJSON(ctx, c, ns, podName, containerName), lastAPIErrorSuffix(lastLogErr))
+	if expectedCount > 0 {
+		t.Errorf("FAIL: Container %s in Pod %s should see exactly %d accelerator device(s) (%s). Logs: %s", containerName, podName, expectedCount, detail, logs)
 	} else {
-		t.Errorf("VIOLATION: Unauthorized Container %s in Pod %s should see no accelerator devices. Logs: %s", containerName, podName, logs)
+		t.Errorf("VIOLATION: Unauthorized Container %s in Pod %s should see no accelerator devices (%s). Logs: %s", containerName, podName, detail, logs)
 	}
+}
+
+// containerStatusJSON returns the named container's status from the live pod
+// (state, lastTerminationState, restartCount, ...) as JSON, or why it could
+// not be read.
+func containerStatusJSON(ctx context.Context, c kubernetes.Interface, ns, podName, containerName string) string {
+	pod, err := c.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Sprintf("<failed to get Pod: %v>", err)
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == containerName {
+			b, err := json.Marshal(cs)
+			if err != nil {
+				return fmt.Sprintf("<failed to marshal: %v>", err)
+			}
+			return string(b)
+		}
+	}
+	return fmt.Sprintf("<container %q not in pod.status.containerStatuses; phase=%s>", containerName, pod.Status.Phase)
 }
 
 func logsContainExactLine(logs, expected string) bool {
