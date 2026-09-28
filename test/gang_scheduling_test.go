@@ -134,7 +134,7 @@ func buildGenericGangSchedulingJob(ns, name string, parallelism int, cpuReq, mem
 		for _, pair := range pairs {
 			kv := strings.SplitN(pair, "=", 2)
 			if len(kv) == 2 {
-				job.ObjectMeta.Labels[kv[0]] = kv[1]
+				job.Labels[kv[0]] = kv[1]
 			}
 		}
 	}
