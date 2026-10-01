@@ -36,6 +36,7 @@ go test -v -short ./test
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
 | `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
+| `TestAcceleratorPerformanceMetrics` | Accelerator Performance Metrics | MUST |
 | `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 | `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
 
