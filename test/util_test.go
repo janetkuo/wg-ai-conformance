@@ -88,6 +88,7 @@ func init() {
 	acceleratorType = flag.String("accelerator-type", "nvidia", "The type of accelerator to test. Supported types: 'nvidia' (default). Support for other types is being added.")
 	allocationMode = flag.String("allocation-mode", allocationModeAuto,
 		"How test pods request accelerators: 'dra' (ResourceClaims), 'device-plugin' (extended resources such as nvidia.com/gpu), or 'auto' (default; prefer DRA when usable, otherwise fall back to the device plugin).")
+	registerFlagGroup("gang", "Gang Scheduling Flags (TestGangScheduling)")
 	gangSchedulerNamespace = flag.String("gang-scheduler-namespace", "",
 		"Namespace pre-configured with gang scheduling resources (e.g., LocalQueue). If empty, the test will generate a random namespace.")
 	gangJobLabels = flag.String("gang-job-labels", "",

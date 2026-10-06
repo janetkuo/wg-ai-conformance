@@ -42,6 +42,7 @@ var (
 )
 
 func init() {
+	registerFlagGroup("autoscaler", "Accelerator Cluster Autoscaling Flags (TestAcceleratorClusterAutoscaling)")
 	autoscalerNodePoolLabel = flag.String("autoscaler-node-pool-label", "",
 		"Node label identifying the accelerator pool to test, in key=value form. The test is skipped when unset for platforms where cluster_autoscaling is N/A.")
 	autoscalerPendingTimeout = flag.Duration("autoscaler-pending-timeout", 2*time.Minute,

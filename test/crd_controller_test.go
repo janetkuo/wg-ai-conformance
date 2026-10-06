@@ -73,6 +73,7 @@ var (
 )
 
 func init() {
+	registerFlagGroup("operator", "Robust CRD Controller Flags (TestRobustCRDControllerOperation)")
 	operatorName = flag.String("operator", "kubeflow-trainer",
 		"Name of the AI operator to test. Supported: kubeflow-trainer.")
 	operatorRuntimeName = flag.String("operator-runtime-name", "",
