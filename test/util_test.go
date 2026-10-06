@@ -68,6 +68,7 @@ var (
 	gangSchedulerNamespace *string
 	gangJobLabels          *string
 	gangNegativeWindow     *time.Duration
+	gangSchedulerName      *string
 	acceleratorConfigs     = map[string]AcceleratorConfig{
 		"nvidia": {
 			DeviceClass:      "gpu.nvidia.com",
@@ -93,11 +94,12 @@ func init() {
 		"Comma-separated key=value labels to apply to the generic gang scheduling Job (e.g. kueue.x-k8s.io/queue-name=e2e-lq).")
 	gangNegativeWindow = flag.Duration("gang-negative-window", 30*time.Second,
 		"Duration to observe the negative gang scheduling test job to verify no pods are partially scheduled.")
+	gangSchedulerName = flag.String("gang-scheduler-name", "kueue",
+		"Name of the gang scheduler being tested (currently supports: 'kueue' or 'volcano'). Used to apply adapter logic if required.")
 }
 
-// buildRESTConfig loads a *rest.Config from the kubeconfig flag. Shared by
-// getClientset and getDynamicClient to avoid duplicating kubeconfig loading.
-func buildRESTConfig(t *testing.T) *rest.Config {
+// getClientConfig creates a REST client config using the kubeconfig flag.
+func getClientConfig(t *testing.T) *rest.Config {
 	t.Helper()
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if *kubeconfig != "" {
@@ -111,23 +113,14 @@ func buildRESTConfig(t *testing.T) *rest.Config {
 }
 
 // getClientset creates a Kubernetes clientset using the kubeconfig flag.
+// Shared helper to avoid duplicating kubeconfig loading across test files.
 func getClientset(t *testing.T) kubernetes.Interface {
 	t.Helper()
-	clientset, err := kubernetes.NewForConfig(buildRESTConfig(t))
+	clientset, err := kubernetes.NewForConfig(getClientConfig(t))
 	if err != nil {
 		t.Fatalf("Error creating kubernetes client: %v", err)
 	}
 	return clientset
-}
-
-// getDynamicClient creates a Kubernetes dynamic client using the kubeconfig flag.
-func getDynamicClient(t *testing.T) dynamic.Interface {
-	t.Helper()
-	dynamicClient, err := dynamic.NewForConfig(buildRESTConfig(t))
-	if err != nil {
-		t.Fatalf("Error creating dynamic client: %v", err)
-	}
-	return dynamicClient
 }
 
 func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Interface, namespace string) error {
@@ -171,6 +164,16 @@ func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Inte
 		return fmt.Errorf("namespace %s was not deleted before the cleanup deadline%s: %w", namespace, lastAPIErrorSuffix(lastAPIError), err)
 	}
 	return nil
+}
+
+// getDynamicClient creates a dynamic Kubernetes client using the kubeconfig flag.
+func getDynamicClient(t *testing.T) dynamic.Interface {
+	t.Helper()
+	client, err := dynamic.NewForConfig(getClientConfig(t))
+	if err != nil {
+		t.Fatalf("Error creating dynamic client: %v", err)
+	}
+	return client
 }
 
 // lookupAcceleratorConfig resolves an -accelerator-type value to its config,
