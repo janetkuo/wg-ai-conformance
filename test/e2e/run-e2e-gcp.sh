@@ -31,9 +31,9 @@ GCE_IMAGE_FAMILY="${GCE_IMAGE_FAMILY:-common-cu129-ubuntu-2404-nvidia-580}"
 GCE_IMAGE_PROJECT="${GCE_IMAGE_PROJECT:-deeplearning-platform-release}"
 K8S_VERSION="${K8S_VERSION:-v1.35.0}"
 GPU_OPERATOR_VERSION="${GPU_OPERATOR_VERSION:-v26.3.1}"
-KUBEFLOW_TRAINER_VERSION="${KUBEFLOW_TRAINER_VERSION:-2.3.0}"
-VOLCANO_VERSION="${VOLCANO_VERSION:-v1.15.0}"
-GANG_SCHEDULER="${GANG_SCHEDULER:-kueue}"
+# Per-test settings (e.g. GANG_SCHEDULER, KUEUE_VERSION, VOLCANO_VERSION,
+# KUBEFLOW_TRAINER_VERSION) are read by the scripts in test/e2e/setup.d/.
+# Export them before running this script to override their defaults.
 BUILD_ID="${BUILD_ID:-$(date +%s)}"
 VM_NAME="ai-conformance-e2e-${BUILD_ID}"
 
@@ -256,118 +256,34 @@ sudo -E env PATH="\${PATH}" nvkind cluster print-gpus --name ai-conformance-clus
 kubectl get nodes -o wide
 REMOTE_SCRIPT
 
+# Forward local overrides for the setup.d scripts to the VM. Only variables
+# that a setup.d script reads with a "${NAME:-default}" fallback are forwarded.
+SETUP_ENV=""
+for name in $(grep -ohE '\$\{[A-Z][A-Z0-9_]*:-' "${REPO_ROOT}"/test/e2e/setup.d/*.sh | sed -E 's/^\$\{([A-Z0-9_]+):-$/\1/' | sort -u); do
+    if [[ -n "${!name+x}" ]]; then
+        SETUP_ENV+="export ${name}=$(printf '%q' "${!name}")"$'\n'
+    fi
+done
+
 echo "================================================================"
-echo "3. Deploying Cluster Prerequisites (NVIDIA DRA Driver, Gang Scheduler & AI Operator)"
+echo "3. Deploying Cluster Prerequisites (test/e2e/setup.d)"
 echo "================================================================"
 gcloud compute ssh "${VM_NAME}" --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --command="bash -s" <<REMOTE_STACK
 set -euo pipefail
 export PATH="/usr/local/go/bin:\${HOME}/go/bin:\${PATH}"
+${SETUP_ENV}
+cd ~/ai-conformance
+export E2E_TEST_ARGS_FILE="\${HOME}/e2e-test-args"
+: >"\${E2E_TEST_ARGS_FILE}"
 
-echo "Installing cert-manager..."
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.19.2/cert-manager.yaml
-kubectl rollout status deployment -n cert-manager cert-manager --timeout=5m
+for setup in test/e2e/setup.d/*.sh; do
+  echo "=== \${setup} ==="
+  bash "\${setup}"
+done
 
-echo "Labeling GPU nodes for DRA driver..."
-kubectl label node --all nvidia.com/gpu.present=true feature.node.kubernetes.io/pci-10de.present=true --overwrite
-
-echo "Installing NVIDIA DRA Driver..."
-helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
-helm repo update
-helm upgrade -i nvidia-dra-driver nvidia/nvidia-dra-driver-gpu \
-    --namespace nvidia-dra-driver \
-    --create-namespace \
-    --set gpuResourcesEnabledOverride=true \
-    --wait --timeout 10m
-
-echo "Checking ResourceSlices & DeviceClasses:"
-kubectl get deviceclasses || true
-kubectl get resourceslices -o wide || true
-
-if [ "${GANG_SCHEDULER}" = "kueue" ]; then
-  echo "Installing Kueue..."
-  kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/v0.18.2/manifests.yaml
-
-  echo "Waiting for Kueue controller manager to be ready..."
-  kubectl rollout status deployment -n kueue-system kueue-controller-manager --timeout=5m
-
-  echo "Creating Kueue resources (with retries for webhook readiness)..."
-  for i in {1..10}; do
-    cat <<EOF | kubectl apply -f - && break
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata:
-  name: e2e-flavor
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ClusterQueue
-metadata:
-  name: e2e-cq
-spec:
-  namespaceSelector: {}
-  resourceGroups:
-  - coveredResources: ["cpu", "memory"]
-    flavors:
-    - name: e2e-flavor
-      resources:
-      - name: "cpu"
-        nominalQuota: 10
-      - name: "memory"
-        nominalQuota: 10Gi
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ai-conformance-gang-scheduling
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: LocalQueue
-metadata:
-  name: e2e-lq
-  namespace: ai-conformance-gang-scheduling
-spec:
-  clusterQueue: e2e-cq
-EOF
-    echo "Webhook might not be ready yet, retrying in 5 seconds... ($i/10)"
-    sleep 5
-  done
-
-  echo "Waiting for ClusterQueue to be active..."
-  kubectl wait --for=condition=Active clusterqueue/e2e-cq --timeout=60s
-elif [ "${GANG_SCHEDULER}" = "volcano" ]; then
-  echo "Installing Volcano..."
-  kubectl apply -f "https://raw.githubusercontent.com/volcano-sh/volcano/${VOLCANO_VERSION}/installer/volcano-development.yaml"
-
-  echo "Waiting for Volcano controllers to be ready..."
-  kubectl rollout status deployment -n volcano-system volcano-admission --timeout=5m
-  kubectl rollout status deployment -n volcano-system volcano-controllers --timeout=5m
-  kubectl rollout status deployment -n volcano-system volcano-scheduler --timeout=5m
-
-  echo "Creating test namespace..."
-  kubectl create namespace ai-conformance-gang-scheduling --dry-run=client -o yaml | kubectl apply -f -
-fi
-
-echo "Installing Kubeflow Trainer (AI Operator for KAR-0063)..."
-helm upgrade -i kubeflow-trainer oci://ghcr.io/kubeflow/charts/kubeflow-trainer \
-    --namespace kubeflow-system \
-    --create-namespace \
-    --version "${KUBEFLOW_TRAINER_VERSION}" \
-    --set runtimes.defaultEnabled=true \
-    --wait --timeout 5m
-
-echo "Verifying Kubeflow Trainer CRDs and default runtimes..."
-kubectl get crd trainjobs.trainer.kubeflow.org
-kubectl get clustertrainingruntime torch-distributed
-kubectl rollout status deployment -n kubeflow-system kubeflow-trainer-controller-manager --timeout=5m
-
+echo "go test flags added by setup.d:"
+cat "\${E2E_TEST_ARGS_FILE}"
 REMOTE_STACK
-
-echo "Preparing go test arguments..."
-if [ "${GANG_SCHEDULER}" = "kueue" ]; then
-    GANG_LABELS="-gang-job-labels=kueue.x-k8s.io/queue-name=e2e-lq"
-else
-    GANG_LABELS=""
-fi
-GANG_ARGS="-gang-scheduler-name=${GANG_SCHEDULER} ${GANG_LABELS}"
 
 echo "================================================================"
 echo "4. Executing AI Conformance Test Suite (test/)"
@@ -378,13 +294,13 @@ export PATH="/usr/local/go/bin:\${HOME}/go/bin:\${PATH}"
 
 cd ~/ai-conformance
 mkdir -p _artifacts
+mapfile -t SETUP_ARGS <"\${HOME}/e2e-test-args"
 
 echo "Running go test ./test/..."
 go test -v ./test/... \
     -accelerator-type=nvidia \
     -allocation-mode=auto \
-    -gang-scheduler-namespace=ai-conformance-gang-scheduling \
-    ${GANG_ARGS} \
+    "\${SETUP_ARGS[@]}" \
     -json | tee _artifacts/results.json
 REMOTE_TEST
 
