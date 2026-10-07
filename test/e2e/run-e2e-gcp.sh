@@ -320,6 +320,7 @@ helm repo update
 helm upgrade -i dcgm-exporter gpu-helm-charts/dcgm-exporter \
     --namespace gpu-operator \
     --create-namespace \
+    --set serviceMonitor.enabled=false \
     --wait --timeout 5m
 
 echo "Waiting for DCGM Exporter DaemonSet to be ready..."
