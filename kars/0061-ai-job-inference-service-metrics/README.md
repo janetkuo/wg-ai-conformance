@@ -44,6 +44,7 @@ This is implemented by `TestAIServiceMetrics` in the AI conformance test suite (
 ## Implementation History
 
 2026-03-12: KAR created
+2026-10-09: Automated conformance test added in test/ai_service_metrics_test.go
 
 ## Related KARs
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -251,8 +252,9 @@ func TestBuildMetricsWorkload(t *testing.T) {
 	if want := metricsPodDeadlineSeconds(*metricsCollectionTimeout); pod.Spec.ActiveDeadlineSeconds == nil || *pod.Spec.ActiveDeadlineSeconds != want {
 		t.Errorf("active deadline seconds = %v, want %d", pod.Spec.ActiveDeadlineSeconds, want)
 	}
-	if c.Env[0].Name != "RUN_ID" || c.Env[0].Value != "run123" {
-		t.Errorf("RUN_ID not passed to the workload: %v", c.Env)
+	wantEnv := []corev1.EnvVar{{Name: "RUN_ID", Value: "run123"}, {Name: "PORT", Value: strconv.Itoa(metricsPort)}}
+	if !reflect.DeepEqual(c.Env, wantEnv) {
+		t.Errorf("env = %v, want %v", c.Env, wantEnv)
 	}
 	// The stub must emit exactly the metric names the verification queries.
 	for _, name := range []string{metricRequestsTotal, metricLatency + "_count", metricQueueDepth, metricsRunLabel} {
@@ -390,48 +392,46 @@ func TestCheckMetricsWorkloadIntact(t *testing.T) {
 	}
 }
 
-func setMetricsFlags(t *testing.T, promSvc, url, tokenFile, manifest, labels string, count int, timeout time.Duration) {
+func setMetricsFlags(t *testing.T, promSvc, url, tokenFile, manifest, labels string, timeout time.Duration) {
 	t.Helper()
 	strs := []*string{metricsPrometheusService, metricsQueryURL, metricsQueryBearerTokenFile, metricsScrapeManifest, metricsScrapeLabels}
 	oldStrs := make([]string, len(strs))
 	for i, p := range strs {
 		oldStrs[i] = *p
 	}
-	oldCount, oldTimeout := *metricsRequestCount, *metricsCollectionTimeout
+	oldTimeout := *metricsCollectionTimeout
 	t.Cleanup(func() {
 		for i, p := range strs {
 			*p = oldStrs[i]
 		}
-		*metricsRequestCount, *metricsCollectionTimeout = oldCount, oldTimeout
+		*metricsCollectionTimeout = oldTimeout
 	})
 	for i, v := range []string{promSvc, url, tokenFile, manifest, labels} {
 		*strs[i] = v
 	}
-	*metricsRequestCount, *metricsCollectionTimeout = count, timeout
+	*metricsCollectionTimeout = timeout
 }
 
 func TestValidateMetricsFlags(t *testing.T) {
 	tests := []struct {
 		name                                      string
 		promSvc, url, tokenFile, manifest, labels string
-		count                                     int
 		timeout                                   time.Duration
 		wantErr                                   string
 	}{
-		{name: "defaults", count: 10, timeout: 5 * time.Minute},
-		{name: "service", promSvc: "monitoring/prometheus-operated:9090", labels: "release=kps", count: 10, timeout: time.Minute},
-		{name: "url with token", url: "https://prom.example", tokenFile: "/token", count: 1, timeout: time.Minute},
-		{name: "both endpoints", promSvc: "m/p:9090", url: "https://prom.example", count: 10, timeout: time.Minute, wantErr: "mutually exclusive"},
-		{name: "token without url", promSvc: "m/p:9090", tokenFile: "/token", count: 10, timeout: time.Minute, wantErr: "requires -service-metrics-query-url"},
-		{name: "token only", tokenFile: "/token", count: 10, timeout: time.Minute, wantErr: "requires -service-metrics-query-url"},
-		{name: "zero requests", promSvc: "m/p:9090", count: 0, timeout: time.Minute, wantErr: "request-count"},
-		{name: "zero timeout", promSvc: "m/p:9090", count: 10, wantErr: "collection-timeout"},
-		{name: "missing manifest", promSvc: "m/p:9090", manifest: "does-not-exist.yaml", count: 10, timeout: time.Minute, wantErr: "scrape-manifest"},
-		{name: "bad labels", promSvc: "m/p:9090", labels: "release", count: 10, timeout: time.Minute, wantErr: "scrape-labels"},
+		{name: "defaults", timeout: 5 * time.Minute},
+		{name: "service", promSvc: "monitoring/prometheus-operated:9090", labels: "release=kps", timeout: time.Minute},
+		{name: "url with token", url: "https://prom.example", tokenFile: "/token", timeout: time.Minute},
+		{name: "both endpoints", promSvc: "m/p:9090", url: "https://prom.example", timeout: time.Minute, wantErr: "mutually exclusive"},
+		{name: "token without url", promSvc: "m/p:9090", tokenFile: "/token", timeout: time.Minute, wantErr: "requires -service-metrics-query-url"},
+		{name: "token only", tokenFile: "/token", timeout: time.Minute, wantErr: "requires -service-metrics-query-url"},
+		{name: "zero timeout", promSvc: "m/p:9090", wantErr: "collection-timeout"},
+		{name: "missing manifest", promSvc: "m/p:9090", manifest: "does-not-exist.yaml", timeout: time.Minute, wantErr: "scrape-manifest"},
+		{name: "bad labels", promSvc: "m/p:9090", labels: "release", timeout: time.Minute, wantErr: "scrape-labels"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			setMetricsFlags(t, tt.promSvc, tt.url, tt.tokenFile, tt.manifest, tt.labels, tt.count, tt.timeout)
+			setMetricsFlags(t, tt.promSvc, tt.url, tt.tokenFile, tt.manifest, tt.labels, tt.timeout)
 			err := validateMetricsFlags()
 			if tt.wantErr == "" {
 				if err != nil {
@@ -447,7 +447,7 @@ func TestValidateMetricsFlags(t *testing.T) {
 }
 
 func TestApplyScrapeConfigServiceMonitor(t *testing.T) {
-	setMetricsFlags(t, "m/p:9090", "", "", "", "release=kube-prometheus-stack", 10, time.Minute)
+	setMetricsFlags(t, "m/p:9090", "", "", "", "release=kube-prometheus-stack", time.Minute)
 	client := fake.NewClientset()
 	client.Discovery().(*fakediscovery.FakeDiscovery).Resources = []*metav1.APIResourceList{{
 		GroupVersion: serviceMonitorGVR.GroupVersion().String(),
@@ -493,7 +493,7 @@ metadata:
 	if err := os.WriteFile(manifest, []byte(tmpl), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	setMetricsFlags(t, "m/p:9090", "", "", manifest, "", 10, time.Minute)
+	setMetricsFlags(t, "m/p:9090", "", "", manifest, "", time.Minute)
 
 	podMonitoringGVR := schema.GroupVersionResource{Group: "monitoring.googleapis.com", Version: "v1", Resource: "podmonitorings"}
 	configMapGVR := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}

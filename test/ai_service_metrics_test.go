@@ -42,6 +42,7 @@ const (
 	metricsPortName          = "http"
 	metricsPort              = 8080
 	metricsRunLabel          = "conformance_run"
+	metricsRequestCount      = 10
 	metricRequestsTotal      = "ai_conformance_inference_requests_total"
 	metricLatency            = "ai_conformance_inference_request_duration_seconds"
 	metricQueueDepth         = "ai_conformance_inference_queue_depth"
@@ -58,7 +59,6 @@ var (
 	metricsQueryBearerTokenFile *string
 	metricsScrapeManifest       *string
 	metricsScrapeLabels         *string
-	metricsRequestCount         *int
 	metricsCollectionTimeout    *time.Duration
 )
 
@@ -74,8 +74,6 @@ func init() {
 		"Optional path to a Go-templated YAML manifest (one or more documents) that configures the platform's monitoring system to scrape the test workload. Available fields: {{.Namespace}}, {{.ServiceName}}, {{.PortName}}, {{.Port}}, {{.AppLabelKey}}, {{.AppLabelValue}}, {{.RunID}}. When unset, a monitoring.coreos.com/v1 ServiceMonitor is created.")
 	metricsScrapeLabels = flag.String("service-metrics-scrape-labels", "",
 		"Comma-separated key=value labels added to the default ServiceMonitor so the platform's Prometheus selects it (e.g. release=kube-prometheus-stack).")
-	metricsRequestCount = flag.Int("service-metrics-request-count", 10,
-		"Number of inference requests sent to the test workload; the collected request counter must equal this value.")
 	metricsCollectionTimeout = flag.Duration("service-metrics-collection-timeout", 5*time.Minute,
 		"How long to wait for the monitoring system to collect the workload's metrics after traffic is sent.")
 }
@@ -107,7 +105,6 @@ func TestAIServiceMetrics(t *testing.T) {
 	ctx := context.Background()
 	namespace := randomNamespaceName("ai-service-metrics")
 	runID := rand.String(10)
-	requestCount := *metricsRequestCount
 
 	// Fail fast on a misconfigured query endpoint before creating anything.
 	if err := preflightQuery(ctx, querier); err != nil {
@@ -139,11 +136,11 @@ func TestAIServiceMetrics(t *testing.T) {
 
 	waitForMetricsWorkloadReady(ctx, t, clientset, namespace)
 
-	t.Logf("Sending %d inference requests...", requestCount)
-	sendInferenceTraffic(ctx, t, clientset, namespace, requestCount)
+	t.Logf("Sending %d inference requests...", metricsRequestCount)
+	sendInferenceTraffic(ctx, t, clientset, namespace, metricsRequestCount)
 
 	t.Logf("Waiting up to %v for the monitoring system to collect the workload's metrics...", *metricsCollectionTimeout)
-	verifyCollectedMetrics(ctx, t, clientset, querier, namespace, runID, requestCount)
+	verifyCollectedMetrics(ctx, t, clientset, querier, namespace, runID, metricsRequestCount)
 }
 
 func validateMetricsFlags() error {
@@ -152,9 +149,6 @@ func validateMetricsFlags() error {
 	}
 	if *metricsQueryBearerTokenFile != "" && *metricsQueryURL == "" {
 		return errors.New("-service-metrics-query-bearer-token-file requires -service-metrics-query-url")
-	}
-	if *metricsRequestCount < 1 {
-		return fmt.Errorf("-service-metrics-request-count must be at least 1, got %d", *metricsRequestCount)
 	}
 	if *metricsCollectionTimeout <= 0 {
 		return fmt.Errorf("-service-metrics-collection-timeout must be positive, got %v", *metricsCollectionTimeout)
@@ -173,10 +167,11 @@ func validateMetricsFlags() error {
 // metricsStubScript is a dependency-free inference stand-in. /healthz is not
 // counted, so probes don't inflate the request count.
 const metricsStubScript = `
-import json, os, threading, time
+import json, os, socket, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RUN = os.environ["RUN_ID"]
+PORT = int(os.environ["PORT"])
 BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0)
 lock = threading.Lock()
 state = {"count": 0, "sum": 0.0, "buckets": [0] * len(BUCKETS), "inflight": 0}
@@ -241,7 +236,16 @@ class Handler(BaseHTTPRequestHandler):
                     state["buckets"][i] += 1
         self.send(200, json.dumps({"output": "ok"}), "application/json")
 
-ThreadingHTTPServer(("", 8080), Handler).serve_forever()
+# Dual-stack when the node has IPv6, so IPv4-only and IPv6-only clusters both work.
+class Server(ThreadingHTTPServer):
+    address_family = socket.AF_INET6 if socket.has_dualstack_ipv6() else socket.AF_INET
+
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+Server(("::" if Server.address_family == socket.AF_INET6 else "", PORT), Handler).serve_forever()
 `
 
 func buildMetricsWorkload(ns, runID string) (*corev1.Pod, *corev1.Service) {
@@ -267,7 +271,7 @@ func buildMetricsWorkload(ns, runID string) (*corev1.Pod, *corev1.Service) {
 				Name:    "server",
 				Image:   metricsWorkloadImage,
 				Command: []string{"python3", "-u", "-c", metricsStubScript},
-				Env:     []corev1.EnvVar{{Name: "RUN_ID", Value: runID}},
+				Env:     []corev1.EnvVar{{Name: "RUN_ID", Value: runID}, {Name: "PORT", Value: strconv.Itoa(metricsPort)}},
 				Ports:   []corev1.ContainerPort{{Name: metricsPortName, ContainerPort: metricsPort}},
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -311,9 +315,7 @@ func metricsPodDeadlineSeconds(collection time.Duration) int64 {
 func deployMetricsWorkload(ctx context.Context, t *testing.T, c kubernetes.Interface, ns, runID string) {
 	t.Helper()
 	pod, svc := buildMetricsWorkload(ns, runID)
-	if _, err := c.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("Failed to create metrics workload Pod: %v", err)
-	}
+	createTestPod(ctx, t, c, pod)
 	if _, err := c.CoreV1().Services(ns).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Failed to create metrics workload Service: %v", err)
 	}
@@ -323,24 +325,22 @@ func deployMetricsWorkload(ctx context.Context, t *testing.T, c kubernetes.Inter
 // through the Service.
 func waitForMetricsWorkloadReady(ctx context.Context, t *testing.T, c kubernetes.Interface, ns string) {
 	t.Helper()
+	var lastAPIError error
 	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, metricsReadyTimeout, true, func(ctx context.Context) (bool, error) {
 		pod, err := c.CoreV1().Pods(ns).Get(ctx, metricsWorkloadName, metav1.GetOptions{})
 		if err != nil {
+			lastAPIError = err
 			if isRetryableAPIError(err) {
 				return false, nil
 			}
 			return false, err
 		}
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-				return true, nil
-			}
-		}
-		return false, nil
+		lastAPIError = nil
+		return podIsReady(pod), nil
 	})
 	if err != nil {
-		t.Fatalf("ENVIRONMENT ERROR: Metrics workload Pod did not become Ready within %v: %v; container state: %s",
-			metricsReadyTimeout, err, containerStatusJSON(ctx, c, ns, metricsWorkloadName, "server"))
+		t.Fatalf("ENVIRONMENT ERROR: Metrics workload Pod did not become Ready within %v%s: %v; container state: %s",
+			metricsReadyTimeout, lastAPIErrorSuffix(lastAPIError), err, containerStatusJSON(ctx, c, ns, metricsWorkloadName, "server"))
 	}
 
 	var lastErr error
