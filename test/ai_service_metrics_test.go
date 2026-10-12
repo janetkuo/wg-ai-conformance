@@ -46,10 +46,12 @@ const (
 	metricRequestsTotal      = "ai_conformance_inference_requests_total"
 	metricLatency            = "ai_conformance_inference_request_duration_seconds"
 	metricQueueDepth         = "ai_conformance_inference_queue_depth"
-	metricsPollInterval      = 10 * time.Second
+	metricsScrapeInterval    = 15 * time.Second
 	metricsReadyTimeout      = 3 * time.Minute
 	metricsPodDeadlineBuffer = 15 * time.Minute
 )
+
+var metricsPollInterval = 10 * time.Second
 
 var serviceMonitorGVR = schema.GroupVersionResource{Group: "monitoring.coreos.com", Version: "v1", Resource: "servicemonitors"}
 
@@ -71,11 +73,11 @@ func init() {
 	metricsQueryBearerTokenFile = flag.String("service-metrics-query-bearer-token-file", "",
 		"Optional file containing a bearer token sent with requests to -service-metrics-query-url.")
 	metricsScrapeManifest = flag.String("service-metrics-scrape-manifest", "",
-		"Optional path to a Go-templated YAML manifest (one or more documents) that configures the platform's monitoring system to scrape the test workload. Available fields: {{.Namespace}}, {{.ServiceName}}, {{.PortName}}, {{.Port}}, {{.AppLabelKey}}, {{.AppLabelValue}}, {{.RunID}}. When unset, a monitoring.coreos.com/v1 ServiceMonitor is created.")
+		"Optional path to a Go-templated YAML manifest (one or more documents) that configures the platform's monitoring system to scrape the test workload. Available fields: {{.Namespace}}, {{.ServiceName}}, {{.PortName}}, {{.Port}}, {{.AppLabelKey}}, {{.AppLabelValue}}, {{.RunID}}, {{.ScrapeInterval}}. When unset, a monitoring.coreos.com/v1 ServiceMonitor is created.")
 	metricsScrapeLabels = flag.String("service-metrics-scrape-labels", "",
 		"Comma-separated key=value labels added to the default ServiceMonitor so the platform's Prometheus selects it (e.g. release=kube-prometheus-stack).")
 	metricsCollectionTimeout = flag.Duration("service-metrics-collection-timeout", 5*time.Minute,
-		"How long to wait for the monitoring system to collect the workload's metrics after traffic is sent.")
+		"How long to wait for the monitoring system to collect the workload's metrics, applied separately before and after traffic is sent. Allow at least 3 scrape intervals plus ingestion delay.")
 }
 
 // TestAIServiceMetrics verifies the AI Job & Inference Service Metrics
@@ -125,22 +127,35 @@ func TestAIServiceMetrics(t *testing.T) {
 
 	t.Log("Configuring the monitoring system to scrape the workload...")
 	applyScrapeConfig(ctx, t, clientset, getDynamicClient(t), scrapeTemplateData{
-		Namespace:     namespace,
-		ServiceName:   metricsWorkloadName,
-		PortName:      metricsPortName,
-		Port:          metricsPort,
-		AppLabelKey:   metricsAppLabelKey,
-		AppLabelValue: metricsWorkloadName,
-		RunID:         runID,
+		Namespace:      namespace,
+		ServiceName:    metricsWorkloadName,
+		PortName:       metricsPortName,
+		Port:           metricsPort,
+		AppLabelKey:    metricsAppLabelKey,
+		AppLabelValue:  metricsWorkloadName,
+		RunID:          runID,
+		ScrapeInterval: metricsScrapeInterval.String(),
 	})
 
 	waitForMetricsWorkloadReady(ctx, t, clientset, namespace)
 
+	t.Logf("Waiting up to %v for the monitoring system to collect the workload's metrics...", *metricsCollectionTimeout)
+	baselines, status, err := waitForBaselines(ctx, clientset, querier, namespace, runID)
+	if err != nil {
+		failMetricsCollection(ctx, t, clientset, namespace, "Workload metrics were not collected", err)
+	}
+	logMetricsStatus(t, status)
+
 	t.Logf("Sending %d inference requests...", metricsRequestCount)
 	sendInferenceTraffic(ctx, t, clientset, namespace, metricsRequestCount)
 
-	t.Logf("Waiting up to %v for the monitoring system to collect the workload's metrics...", *metricsCollectionTimeout)
-	verifyCollectedMetrics(ctx, t, clientset, querier, namespace, runID, metricsRequestCount)
+	t.Logf("Waiting up to %v for the collected request counts to increase by %d...", *metricsCollectionTimeout, metricsRequestCount)
+	status, err = waitForIncrease(ctx, clientset, querier, namespace, runID, baselines, metricsRequestCount)
+	if err != nil {
+		failMetricsCollection(ctx, t, clientset, namespace, "Collected request counts did not increase as expected", err)
+	}
+	logMetricsStatus(t, status)
+	t.Logf("The monitoring system collected the workload's request count, latency and queue depth metrics")
 }
 
 func validateMetricsFlags() error {
@@ -307,8 +322,9 @@ func buildMetricsWorkload(ns, runID string) (*corev1.Pod, *corev1.Service) {
 }
 
 // metricsPodDeadlineSeconds bounds the workload's lifetime if cleanup fails.
+// The collection timeout applies twice: before and after traffic.
 func metricsPodDeadlineSeconds(collection time.Duration) int64 {
-	lifetime := metricsReadyTimeout + time.Minute + collection + metricsPodDeadlineBuffer
+	lifetime := metricsReadyTimeout + time.Minute + 2*collection + metricsPodDeadlineBuffer
 	return int64((lifetime + time.Second - 1) / time.Second)
 }
 
@@ -365,13 +381,14 @@ func sendInferenceTraffic(ctx context.Context, t *testing.T, c kubernetes.Interf
 }
 
 type scrapeTemplateData struct {
-	Namespace     string
-	ServiceName   string
-	PortName      string
-	Port          int
-	AppLabelKey   string
-	AppLabelValue string
-	RunID         string
+	Namespace      string
+	ServiceName    string
+	PortName       string
+	Port           int
+	AppLabelKey    string
+	AppLabelValue  string
+	RunID          string
+	ScrapeInterval string
 }
 
 func applyScrapeConfig(ctx context.Context, t *testing.T, c kubernetes.Interface, dyn dynamic.Interface, data scrapeTemplateData) {
@@ -456,7 +473,7 @@ func buildServiceMonitor(d scrapeTemplateData, labels map[string]string) *unstru
 			"endpoints": []any{map[string]any{
 				"port":     d.PortName,
 				"path":     "/metrics",
-				"interval": "15s",
+				"interval": d.ScrapeInterval,
 			}},
 		},
 	}}
@@ -670,27 +687,59 @@ func preflightQuery(ctx context.Context, q promQuerier) error {
 type metricExpectation struct {
 	description string
 	query       string
-	want        float64
-	// exact requires value == want; otherwise any sample passes.
-	exact bool
+	// counter must increase by the request count; otherwise any sample passes.
+	counter bool
 }
 
 // metricExpectations uses max() rather than sum() so a target discovered
 // twice isn't double-counted.
-func metricExpectations(runID string, requests int) []metricExpectation {
+func metricExpectations(runID string) []metricExpectation {
 	sel := fmt.Sprintf(`{%s=%q}`, metricsRunLabel, runID)
 	return []metricExpectation{
-		{"request count", "max(" + metricRequestsTotal + sel + ")", float64(requests), true},
-		{"request latency histogram count", "max(" + metricLatency + "_count" + sel + ")", float64(requests), true},
-		{"queue depth gauge", "max(" + metricQueueDepth + sel + ")", 0, false},
+		{"request count", "max(" + metricRequestsTotal + sel + ")", true},
+		{"request latency histogram count", "max(" + metricLatency + "_count" + sel + ")", true},
+		{"queue depth gauge", "max(" + metricQueueDepth + sel + ")", false},
 	}
 }
 
-func verifyCollectedMetrics(ctx context.Context, t *testing.T, client kubernetes.Interface, q promQuerier, ns, runID string, requests int) {
-	t.Helper()
-	checks := metricExpectations(runID, requests)
-	status := make([]string, len(checks))
+// waitForBaselines waits until every series is collected and returns the
+// values seen. Some backends (e.g. Google Managed Prometheus) store counters
+// relative to their first sample, so traffic is checked as an increase from
+// these baselines rather than as raw values.
+func waitForBaselines(ctx context.Context, client kubernetes.Interface, q promQuerier, ns, runID string) ([]float64, []string, error) {
+	return pollMetrics(ctx, client, q, ns, metricExpectations(runID), func(_ int, v float64) (string, bool, error) {
+		return fmt.Sprintf("collected (baseline %v)", v), true, nil
+	})
+}
 
+func waitForIncrease(ctx context.Context, client kubernetes.Interface, q promQuerier, ns, runID string, baselines []float64, requests int) ([]string, error) {
+	checks := metricExpectations(runID)
+	_, status, err := pollMetrics(ctx, client, q, ns, checks, func(i int, v float64) (string, bool, error) {
+		if !checks[i].counter {
+			return fmt.Sprintf("ok (%v)", v), true, nil
+		}
+		base := baselines[i]
+		want := base + float64(requests)
+		switch {
+		case v > want:
+			// Counters only grow, so waiting longer cannot fix this.
+			return "", false, fmt.Errorf("got %v, want %v (baseline %v + %d); extra requests reached the workload", v, want, base, requests)
+		case v < base:
+			return fmt.Sprintf("got %v, below baseline %v; the counter was reset or the collector restarted", v, base), false, nil
+		case v != want:
+			return fmt.Sprintf("got %v, want %v (baseline %v + %d)", v, want, base, requests), false, nil
+		}
+		return fmt.Sprintf("ok (%v = baseline %v + %d)", v, base, requests), true, nil
+	})
+	return status, err
+}
+
+// pollMetrics queries every series each poll until eval accepts all of them,
+// returning the last value and status of each.
+func pollMetrics(ctx context.Context, client kubernetes.Interface, q promQuerier, ns string, checks []metricExpectation,
+	eval func(i int, v float64) (status string, ok bool, err error)) ([]float64, []string, error) {
+	values := make([]float64, len(checks))
+	status := make([]string, len(checks))
 	err := wait.PollUntilContextTimeout(ctx, metricsPollInterval, *metricsCollectionTimeout, true, func(ctx context.Context) (bool, error) {
 		if err := checkMetricsWorkloadIntact(ctx, client, ns); err != nil {
 			return false, err
@@ -715,27 +764,38 @@ func verifyCollectedMetrics(ctx context.Context, t *testing.T, client kubernetes
 			case !found:
 				status[i] = fmt.Sprintf("%s: not collected yet (%s)", c.description, c.query)
 				done = false
-			case c.exact && v > c.want:
-				// Counters only grow, so waiting longer cannot fix this.
-				return false, fmt.Errorf("%s: got %v, want %v; extra requests reached the workload", c.description, v, c.want)
-			case c.exact && v != c.want:
-				status[i] = fmt.Sprintf("%s: got %v, want %v", c.description, v, c.want)
-				done = false
 			default:
-				status[i] = fmt.Sprintf("%s: ok (%v)", c.description, v)
+				s, ok, err := eval(i, v)
+				if err != nil {
+					return false, fmt.Errorf("%s: %w", c.description, err)
+				}
+				values[i], status[i] = v, c.description+": "+s
+				done = done && ok
 			}
 		}
 		return done, nil
 	})
 	if err != nil {
-		t.Fatalf("FAIL: Workload metrics were not collected as expected (timeout %v): %v\n  %s\n  container state: %s",
-			*metricsCollectionTimeout, err, strings.Join(status, "\n  "),
-			containerStatusJSON(ctx, client, ns, metricsWorkloadName, "server"))
+		hint := ""
+		if wait.Interrupted(err) {
+			hint = "\n  If the scrape interval or ingestion delay is long, raise -service-metrics-collection-timeout"
+		}
+		return nil, nil, fmt.Errorf("%w\n  %s%s", err, strings.Join(status, "\n  "), hint)
 	}
+	return values, status, nil
+}
+
+func failMetricsCollection(ctx context.Context, t *testing.T, client kubernetes.Interface, ns, what string, err error) {
+	t.Helper()
+	t.Fatalf("FAIL: %s (timeout %v): %v\n  container state: %s",
+		what, *metricsCollectionTimeout, err, containerStatusJSON(ctx, client, ns, metricsWorkloadName, "server"))
+}
+
+func logMetricsStatus(t *testing.T, status []string) {
+	t.Helper()
 	for _, s := range status {
 		t.Logf("  %s", s)
 	}
-	t.Logf("The monitoring system collected the workload's request count, latency and queue depth metrics")
 }
 
 // checkMetricsWorkloadIntact fails if the Pod stops or restarts, which resets

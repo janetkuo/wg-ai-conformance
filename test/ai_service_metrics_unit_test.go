@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -153,6 +154,7 @@ func testScrapeData() scrapeTemplateData {
 	return scrapeTemplateData{
 		Namespace: "ai-service-metrics-abcde", ServiceName: metricsWorkloadName, PortName: metricsPortName,
 		Port: metricsPort, AppLabelKey: metricsAppLabelKey, AppLabelValue: metricsWorkloadName, RunID: "run123",
+		ScrapeInterval: metricsScrapeInterval.String(),
 	}
 }
 
@@ -169,6 +171,7 @@ spec:
       {{.AppLabelKey}}: {{.AppLabelValue}}
   endpoints:
   - port: {{.PortName}}
+    interval: {{.ScrapeInterval}}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -185,6 +188,9 @@ metadata:
 		}
 		if objs[0].GetKind() != "PodMonitoring" || objs[0].GetName() != metricsWorkloadName {
 			t.Errorf("first object: got %s %s", objs[0].GetKind(), objs[0].GetName())
+		}
+		if ep := objs[0].Object["spec"].(map[string]any)["endpoints"].([]any)[0].(map[string]any); ep["interval"] != "15s" {
+			t.Errorf("interval: got %v, want 15s", ep["interval"])
 		}
 		if objs[0].GetNamespace() != "" {
 			t.Errorf("namespace should be left empty for the test to default, got %q", objs[0].GetNamespace())
@@ -231,7 +237,7 @@ func TestBuildServiceMonitor(t *testing.T) {
 		t.Errorf("selector does not match the workload Service: %v", match)
 	}
 	ep := spec["endpoints"].([]any)[0].(map[string]any)
-	if ep["port"] != metricsPortName || ep["path"] != "/metrics" {
+	if ep["port"] != metricsPortName || ep["path"] != "/metrics" || ep["interval"] != "15s" {
 		t.Errorf("unexpected endpoint %v", ep)
 	}
 }
@@ -265,7 +271,7 @@ func TestBuildMetricsWorkload(t *testing.T) {
 }
 
 func TestMetricExpectations(t *testing.T) {
-	checks := metricExpectations("run123", 10)
+	checks := metricExpectations("run123")
 	if len(checks) != 3 {
 		t.Fatalf("got %d checks, want 3", len(checks))
 	}
@@ -274,8 +280,146 @@ func TestMetricExpectations(t *testing.T) {
 			t.Errorf("query %q must use max() and select the run ID", c.query)
 		}
 	}
-	if !checks[0].exact || checks[0].want != 10 {
-		t.Errorf("request count must be an exact check for 10, got %+v", checks[0])
+	if !checks[0].counter || !checks[1].counter || checks[2].counter {
+		t.Errorf("request and histogram counts must be counters and the gauge must not, got %+v", checks)
+	}
+}
+
+// scriptedQuerier answers each query with the next scripted value, repeating
+// the last one; "" is an empty result.
+type scriptedQuerier struct {
+	script map[string][]string
+	calls  map[string]int
+}
+
+func newScriptedQuerier(runID string, series ...[]string) *scriptedQuerier {
+	q := &scriptedQuerier{script: map[string][]string{}, calls: map[string]int{}}
+	for i, c := range metricExpectations(runID) {
+		q.script[c.query] = series[i]
+	}
+	return q
+}
+
+func (q *scriptedQuerier) Query(_ context.Context, promql string) ([]byte, error) {
+	vals := q.script[promql]
+	v := vals[min(q.calls[promql], len(vals)-1)]
+	q.calls[promql]++
+	if v == "" {
+		return []byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`), nil
+	}
+	return []byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"` + v + `"]}]}}`), nil
+}
+
+func setFastMetricsPolling(t *testing.T) kubernetes.Interface {
+	t.Helper()
+	old := metricsPollInterval
+	metricsPollInterval = time.Millisecond
+	t.Cleanup(func() { metricsPollInterval = old })
+	setMetricsFlags(t, "", "", "", "", "", 200*time.Millisecond)
+	return fake.NewClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: metricsWorkloadName, Namespace: "ns"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+}
+
+func TestWaitForBaselines(t *testing.T) {
+	tests := []struct {
+		name          string
+		series        [][]string
+		wantBaselines []float64
+		wantErr       string
+	}{
+		{
+			name:          "series appear after a few scrapes",
+			series:        [][]string{{"", "", "3"}, {"", "3"}, {"", "0"}},
+			wantBaselines: []float64{3, 3, 0},
+		},
+		{
+			name:    "gauge never collected",
+			series:  [][]string{{"0"}, {"0"}, {""}},
+			wantErr: "queue depth gauge: not collected yet",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := setFastMetricsPolling(t)
+			got, _, err := waitForBaselines(context.Background(), client, newScriptedQuerier("run123", tt.series...), "ns", "run123")
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "raise -service-metrics-collection-timeout") {
+					t.Fatalf("got %v, want timeout error containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.wantBaselines) {
+				t.Fatalf("baselines = %v, want %v", got, tt.wantBaselines)
+			}
+		})
+	}
+}
+
+func TestWaitForIncrease(t *testing.T) {
+	tests := []struct {
+		name      string
+		baselines []float64
+		series    [][]string
+		wantErr   string
+		wantFast  bool
+	}{
+		{
+			name:      "counters stored relative to the first sample",
+			baselines: []float64{0, 0, 0},
+			series:    [][]string{{"0", "10"}, {"0", "0", "10"}, {"0"}},
+		},
+		{
+			name:      "nonzero baseline",
+			baselines: []float64{3, 3, 0},
+			series:    [][]string{{"3", "13"}, {"13"}, {"0"}},
+		},
+		{
+			name:      "dip below baseline then recovery",
+			baselines: []float64{3, 3, 0},
+			series:    [][]string{{"3", "1", "13"}, {"13"}, {"0"}},
+		},
+		{
+			name:      "extra requests",
+			baselines: []float64{3, 3, 0},
+			series:    [][]string{{"14"}, {"13"}, {"0"}},
+			wantErr:   "request count: got 14, want 13 (baseline 3 + 10); extra requests",
+			wantFast:  true,
+		},
+		{
+			name:      "partial increase",
+			baselines: []float64{3, 3, 0},
+			series:    [][]string{{"8"}, {"13"}, {"0"}},
+			wantErr:   "request count: got 8, want 13 (baseline 3 + 10)",
+		},
+		{
+			name:      "counter reset",
+			baselines: []float64{3, 3, 0},
+			series:    [][]string{{"1"}, {"13"}, {"0"}},
+			wantErr:   "below baseline 3; the counter was reset",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := setFastMetricsPolling(t)
+			_, err := waitForIncrease(context.Background(), client, newScriptedQuerier("run123", tt.series...), "ns", "run123", tt.baselines, 10)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("got %v, want error containing %q", err, tt.wantErr)
+			}
+			if hinted := strings.Contains(err.Error(), "raise -service-metrics-collection-timeout"); hinted == tt.wantFast {
+				t.Errorf("timeout hint present = %v, want %v: %v", hinted, !tt.wantFast, err)
+			}
+		})
 	}
 }
 
