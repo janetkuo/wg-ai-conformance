@@ -19,9 +19,9 @@ The Kubernetes community has actively invested in tooling and runtimes for these
 - [x] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
 
 **MUST**
-- [ ] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
-- [ ] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
-- [ ] Kubernetes core APIs must be GA
+- [x] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
+- [x] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
+- [x] Kubernetes core APIs must be GA
 
 ## Test Plan
 
@@ -49,5 +49,8 @@ The automated conformance test (`TestWorkloadSandboxing` in `test/workload_sandb
 ## Implementation History
 
 2026-05-20: KAR created
+2026-08-26: Added as SHOULD in v1.37
+2026-10-16: Automated test `TestWorkloadSandboxing` added to the conformance test suite
+2026-10-16: Graduated to MUST, targeting v1.38
 
 ## Related KARs
