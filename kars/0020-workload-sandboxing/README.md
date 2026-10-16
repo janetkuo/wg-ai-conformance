@@ -41,10 +41,10 @@ Validate the following observable outcomes by configuring a sandboxed `RuntimeCl
 
 ### Automated Tests
 
-An automated conformance test could verify the observable outcomes above:
-1. Leverage standard `RuntimeClass` definitions (or a configurable sandboxed runtime handler) to dynamically provision a sandboxed test pod.
-1. Execute verification scripts within the test pod to confirm process, memory, filesystem, and network isolation from the host node (e.g., verifying distinct kernel versions, namespace separation, blocked host mounts, and restricted egress).
-1. If a platform employs a specialized or unrecognized sandboxing mechanism that cannot be automatically verified, the test suite will output an "Unknown" status, signaling that manual attestation is required.
+The automated conformance test (`TestWorkloadSandboxing` in `test/workload_sandboxing_test.go`) verifies the observable outcomes above:
+1. Detects a sandboxed `RuntimeClass` (e.g. `gvisor`, `kata`), or uses the one given with `-sandbox-runtime-class=<name>`; if none is detected or specified, the test is skipped with guidance for manual attestation.
+1. Runs a probe pod with that `RuntimeClass` and checks process, memory, filesystem, and network isolation from the host node from inside the sandbox.
+1. Runs the same probe in an unsandboxed pod on the same node and requires the sandboxed pod to observe a different kernel identity (kernel release, `/proc/version`, boot ID), which a plain container cannot do.
 
 ## Implementation History
 
