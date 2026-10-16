@@ -3,6 +3,8 @@ package conformance
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -59,6 +61,8 @@ var (
 	metricsPrometheusService    *string
 	metricsQueryURL             *string
 	metricsQueryBearerTokenFile *string
+	metricsQueryHeaders         *string
+	metricsQueryCAFile          *string
 	metricsScrapeManifest       *string
 	metricsScrapeLabels         *string
 	metricsCollectionTimeout    *time.Duration
@@ -72,6 +76,10 @@ func init() {
 		"Base URL of a Prometheus-compatible HTTP query API (the test appends /api/v1/query), for monitoring systems not reachable as an in-cluster Service. Mutually exclusive with -service-metrics-prometheus-service.")
 	metricsQueryBearerTokenFile = flag.String("service-metrics-query-bearer-token-file", "",
 		"Optional file containing a bearer token sent with requests to -service-metrics-query-url.")
+	metricsQueryHeaders = flag.String("service-metrics-query-headers", "",
+		"Optional comma-separated key=value HTTP headers sent with requests to -service-metrics-query-url, e.g. a tenant header such as X-Scope-OrgID=<tenant>. Put secrets in -service-metrics-query-bearer-token-file instead.")
+	metricsQueryCAFile = flag.String("service-metrics-query-ca-file", "",
+		"Optional PEM file of CA certificates trusted, in addition to the system roots, for -service-metrics-query-url.")
 	metricsScrapeManifest = flag.String("service-metrics-scrape-manifest", "",
 		"Optional path to a Go-templated YAML manifest (one or more documents) that configures the platform's monitoring system to scrape the test workload. Available fields: {{.Namespace}}, {{.ServiceName}}, {{.PortName}}, {{.Port}}, {{.AppLabelKey}}, {{.AppLabelValue}}, {{.RunID}}, {{.ScrapeInterval}}. When unset, a monitoring.coreos.com/v1 ServiceMonitor is created.")
 	metricsScrapeLabels = flag.String("service-metrics-scrape-labels", "",
@@ -110,7 +118,7 @@ func TestAIServiceMetrics(t *testing.T) {
 
 	// Fail fast on a misconfigured query endpoint before creating anything.
 	if err := preflightQuery(ctx, querier); err != nil {
-		t.Fatalf("ENVIRONMENT ERROR: Metrics query API preflight failed (check -service-metrics-prometheus-service / -service-metrics-query-url and credentials): %v", err)
+		t.Fatalf("ENVIRONMENT ERROR: Metrics query API preflight failed (check -service-metrics-prometheus-service or the -service-metrics-query-* flags and credentials): %v", err)
 	}
 
 	if _, err := clientset.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{}); err != nil {
@@ -162,8 +170,24 @@ func validateMetricsFlags() error {
 	if *metricsPrometheusService != "" && *metricsQueryURL != "" {
 		return errors.New("-service-metrics-prometheus-service and -service-metrics-query-url are mutually exclusive")
 	}
-	if *metricsQueryBearerTokenFile != "" && *metricsQueryURL == "" {
-		return errors.New("-service-metrics-query-bearer-token-file requires -service-metrics-query-url")
+	if *metricsQueryURL == "" {
+		for _, f := range []struct{ name, value string }{
+			{"-service-metrics-query-bearer-token-file", *metricsQueryBearerTokenFile},
+			{"-service-metrics-query-headers", *metricsQueryHeaders},
+			{"-service-metrics-query-ca-file", *metricsQueryCAFile},
+		} {
+			if f.value != "" {
+				return fmt.Errorf("%s requires -service-metrics-query-url", f.name)
+			}
+		}
+	}
+	if _, err := parseKeyValueLabels(*metricsQueryHeaders); err != nil {
+		return fmt.Errorf("-service-metrics-query-headers: %w", err)
+	}
+	if *metricsQueryCAFile != "" {
+		if _, err := os.Stat(*metricsQueryCAFile); err != nil {
+			return fmt.Errorf("-service-metrics-query-ca-file: %w", err)
+		}
 	}
 	if *metricsCollectionTimeout <= 0 {
 		return fmt.Errorf("-service-metrics-collection-timeout must be positive, got %v", *metricsCollectionTimeout)
@@ -542,7 +566,17 @@ func (q serviceProxyQuerier) Query(ctx context.Context, promql string) ([]byte, 
 type httpQuerier struct {
 	baseURL     string
 	bearerToken string
+	headers     map[string]string
 	client      *http.Client
+}
+
+type queryHTTPError struct {
+	code int
+	body string
+}
+
+func (e *queryHTTPError) Error() string {
+	return fmt.Sprintf("query API returned HTTP %d: %s", e.code, e.body)
 }
 
 func (q httpQuerier) Query(ctx context.Context, promql string) ([]byte, error) {
@@ -550,6 +584,9 @@ func (q httpQuerier) Query(ctx context.Context, promql string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
+	}
+	for k, v := range q.headers {
+		req.Header.Set(k, v)
 	}
 	if q.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+q.bearerToken)
@@ -565,14 +602,31 @@ func (q httpQuerier) Query(ctx context.Context, promql string) ([]byte, error) {
 	}
 	// Prometheus returns 4xx/5xx with a JSON error body; surface both.
 	if resp.StatusCode != http.StatusOK {
-		return body, fmt.Errorf("query API returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return body, &queryHTTPError{code: resp.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	return body, nil
 }
 
 func newPromQuerier(c kubernetes.Interface) (promQuerier, error) {
 	if *metricsQueryURL != "" {
-		q := httpQuerier{baseURL: *metricsQueryURL, client: &http.Client{Timeout: 30 * time.Second}}
+		headers, _ := parseKeyValueLabels(*metricsQueryHeaders) // validated in validateMetricsFlags
+		q := httpQuerier{baseURL: *metricsQueryURL, headers: headers, client: &http.Client{Timeout: 30 * time.Second}}
+		if *metricsQueryCAFile != "" {
+			caPEM, err := os.ReadFile(*metricsQueryCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("reading -service-metrics-query-ca-file: %w", err)
+			}
+			pool, err := x509.SystemCertPool()
+			if err != nil {
+				pool = x509.NewCertPool()
+			}
+			if !pool.AppendCertsFromPEM(caPEM) {
+				return nil, errors.New("-service-metrics-query-ca-file: no PEM certificates found")
+			}
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+			q.client.Transport = tr
+		}
 		if *metricsQueryBearerTokenFile != "" {
 			tok, err := os.ReadFile(*metricsQueryBearerTokenFile)
 			if err != nil {
@@ -684,6 +738,21 @@ func preflightQuery(ctx context.Context, q promQuerier) error {
 	return nil
 }
 
+// permanentQueryError reports whether a query failed with a client error
+// that retrying won't fix, e.g. an expired token or missing tenant header.
+func permanentQueryError(err error) bool {
+	var code int
+	var httpErr *queryHTTPError
+	var apiErr apierrors.APIStatus
+	switch {
+	case errors.As(err, &httpErr):
+		code = httpErr.code
+	case errors.As(err, &apiErr):
+		code = int(apiErr.Status().Code)
+	}
+	return code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests
+}
+
 type metricExpectation struct {
 	description string
 	query       string
@@ -752,6 +821,9 @@ func pollMetrics(ctx context.Context, client kubernetes.Interface, q promQuerier
 					// Keep the previous status; a deadline error says nothing about collection.
 					return false, nil
 				}
+				if permanentQueryError(err) {
+					return false, fmt.Errorf("%s: %w", c.description, err)
+				}
 				status[i] = fmt.Sprintf("%s: query error: %v", c.description, err)
 				done = false
 				continue
@@ -776,17 +848,27 @@ func pollMetrics(ctx context.Context, client kubernetes.Interface, q promQuerier
 		return done, nil
 	})
 	if err != nil {
+		if permanentQueryError(err) {
+			return nil, nil, err
+		}
+		report := strings.Join(status, "\n  ")
 		hint := ""
 		if wait.Interrupted(err) {
 			hint = "\n  If the scrape interval or ingestion delay is long, raise -service-metrics-collection-timeout"
+			if strings.Contains(report, "not collected yet") {
+				hint += "; also check that the query endpoint and any tenant header match where the collector writes"
+			}
 		}
-		return nil, nil, fmt.Errorf("%w\n  %s%s", err, strings.Join(status, "\n  "), hint)
+		return nil, nil, fmt.Errorf("%w\n  %s%s", err, report, hint)
 	}
 	return values, status, nil
 }
 
 func failMetricsCollection(ctx context.Context, t *testing.T, client kubernetes.Interface, ns, what string, err error) {
 	t.Helper()
+	if permanentQueryError(err) {
+		t.Fatalf("ENVIRONMENT ERROR: Metrics query API rejected a query (check -service-metrics-prometheus-service or the -service-metrics-query-* flags and credentials): %v", err)
+	}
 	t.Fatalf("FAIL: %s (timeout %v): %v\n  container state: %s",
 		what, *metricsCollectionTimeout, err, containerStatusJSON(ctx, client, ns, metricsWorkloadName, "server"))
 }

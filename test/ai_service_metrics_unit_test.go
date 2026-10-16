@@ -2,6 +2,8 @@ package conformance
 
 import (
 	"context"
+	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,9 +15,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
@@ -315,7 +319,7 @@ func setFastMetricsPolling(t *testing.T) kubernetes.Interface {
 	old := metricsPollInterval
 	metricsPollInterval = time.Millisecond
 	t.Cleanup(func() { metricsPollInterval = old })
-	setMetricsFlags(t, "", "", "", "", "", 200*time.Millisecond)
+	setMetricsFlags(t, metricsFlagValues{timeout: 200 * time.Millisecond})
 	return fake.NewClientset(&corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: metricsWorkloadName, Namespace: "ns"},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
@@ -345,7 +349,7 @@ func TestWaitForBaselines(t *testing.T) {
 			client := setFastMetricsPolling(t)
 			got, _, err := waitForBaselines(context.Background(), client, newScriptedQuerier("run123", tt.series...), "ns", "run123")
 			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "raise -service-metrics-collection-timeout") {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "raise -service-metrics-collection-timeout; also check that the query endpoint and any tenant header") {
 					t.Fatalf("got %v, want timeout error containing %q", err, tt.wantErr)
 				}
 				return
@@ -419,39 +423,61 @@ func TestWaitForIncrease(t *testing.T) {
 			if hinted := strings.Contains(err.Error(), "raise -service-metrics-collection-timeout"); hinted == tt.wantFast {
 				t.Errorf("timeout hint present = %v, want %v: %v", hinted, !tt.wantFast, err)
 			}
+			if strings.Contains(err.Error(), "tenant header") {
+				t.Errorf("endpoint hint present although every series was collected: %v", err)
+			}
 		})
 	}
 }
 
 func TestHTTPQuerier(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/prom/api/v1/query" {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path != "/prom/api/v1/query":
 			http.Error(w, `{"status":"error","error":"wrong path"}`, http.StatusNotFound)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer s3cret" {
+		case r.Header.Get("Authorization") != "Bearer s3cret":
 			http.Error(w, `{"status":"error","error":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
-		if r.URL.Query().Get("query") != "vector(1)" {
+		case r.Header.Get("X-Scope-OrgID") != "tenant-a":
+			http.Error(w, "no org id", http.StatusUnauthorized)
+		case r.URL.Query().Get("query") != "vector(1)":
 			http.Error(w, `{"status":"error","error":"wrong query"}`, http.StatusBadRequest)
-			return
+		default:
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}`))
 		}
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}`))
 	}))
 	defer srv.Close()
+	dir := t.TempDir()
+	writeFile := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	caFile := writeFile("ca.pem", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})))
+	badCA := writeFile("bad.pem", "not a certificate")
+	token := writeFile("token", "s3cret\n")
+	wrongToken := writeFile("wrong-token", "wrong")
+	const tenant = "X-Scope-OrgID=tenant-a"
 
 	for _, tt := range []struct {
-		name    string
-		token   string
-		wantErr string
+		name, tokenFile, headers, caFile string
+		wantErr                          string
 	}{
-		{name: "valid token", token: "s3cret"},
-		{name: "wrong token", token: "wrong", wantErr: "HTTP 401"},
+		{name: "token, header and ca", tokenFile: token, headers: tenant, caFile: caFile},
+		{name: "token file wins over Authorization header", tokenFile: token, headers: tenant + ",Authorization=Bearer wrong", caFile: caFile},
+		{name: "wrong token", tokenFile: wrongToken, headers: tenant, caFile: caFile, wantErr: "HTTP 401"},
+		{name: "no tenant header", tokenFile: token, caFile: caFile, wantErr: "HTTP 401: no org id"},
+		{name: "no ca", tokenFile: token, headers: tenant, wantErr: "certificate"},
+		{name: "non-PEM ca", tokenFile: token, headers: tenant, caFile: badCA, wantErr: "no PEM certificates"},
+		{name: "missing token file", tokenFile: filepath.Join(dir, "missing"), headers: tenant, caFile: caFile, wantErr: "bearer-token-file"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			q := httpQuerier{baseURL: srv.URL + "/prom/", bearerToken: tt.token, client: srv.Client()}
-			err := preflightQuery(context.Background(), q)
+			setMetricsFlags(t, metricsFlagValues{url: srv.URL + "/prom/", tokenFile: tt.tokenFile, headers: tt.headers, caFile: tt.caFile, timeout: time.Minute})
+			q, err := newPromQuerier(nil)
+			if err == nil {
+				err = preflightQuery(context.Background(), q)
+			}
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -463,6 +489,62 @@ func TestHTTPQuerier(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPermanentQueryError(t *testing.T) {
+	gr := schema.GroupResource{Resource: "services"}
+	for _, tt := range []struct {
+		err  error
+		want bool
+	}{
+		{&queryHTTPError{code: 400}, true},
+		{&queryHTTPError{code: 401}, true},
+		{&queryHTTPError{code: 403}, true},
+		{&queryHTTPError{code: 404}, true},
+		{&queryHTTPError{code: 422}, true},
+		{apierrors.NewGenericServerResponse(403, "get", gr, "prometheus", "", 0, true), true},
+		{&queryHTTPError{code: 408}, false},
+		{&queryHTTPError{code: 429}, false},
+		{&queryHTTPError{code: 500}, false},
+		{&queryHTTPError{code: 503}, false},
+		{apierrors.NewServiceUnavailable("proxy"), false},
+		{apierrors.NewTooManyRequests("slow down", 1), false},
+		{errors.New("connection refused"), false},
+		{context.DeadlineExceeded, false},
+	} {
+		if got := permanentQueryError(tt.err); got != tt.want {
+			t.Errorf("permanentQueryError(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+type errQuerier struct {
+	err   error
+	calls int
+}
+
+func (q *errQuerier) Query(context.Context, string) ([]byte, error) {
+	q.calls++
+	return nil, q.err
+}
+
+func TestWaitForBaselinesQueryErrors(t *testing.T) {
+	t.Run("client error fails fast", func(t *testing.T) {
+		client := setFastMetricsPolling(t)
+		q := &errQuerier{err: &queryHTTPError{code: 401, body: "unauthorized"}}
+		_, _, err := waitForBaselines(context.Background(), client, q, "ns", "run")
+		if err == nil || err.Error() != "request count: query API returned HTTP 401: unauthorized" || !permanentQueryError(err) || wait.Interrupted(err) || q.calls != 1 {
+			t.Fatalf("got %v after %d queries, want an immediate HTTP 401 failure", err, q.calls)
+		}
+	})
+	t.Run("server error is retried", func(t *testing.T) {
+		client := setFastMetricsPolling(t)
+		q := &errQuerier{err: &queryHTTPError{code: 503, body: "unavailable"}}
+		_, _, err := waitForBaselines(context.Background(), client, q, "ns", "run")
+		if !wait.Interrupted(err) || q.calls <= len(metricExpectations("run")) {
+			t.Fatalf("got %v after %d queries, want a timeout after retries", err, q.calls)
+		}
+	})
 }
 
 func TestDeployMetricsWorkload(t *testing.T) {
@@ -536,9 +618,14 @@ func TestCheckMetricsWorkloadIntact(t *testing.T) {
 	}
 }
 
-func setMetricsFlags(t *testing.T, promSvc, url, tokenFile, manifest, labels string, timeout time.Duration) {
+type metricsFlagValues struct {
+	promSvc, url, tokenFile, headers, caFile, manifest, labels string
+	timeout                                                    time.Duration
+}
+
+func setMetricsFlags(t *testing.T, v metricsFlagValues) {
 	t.Helper()
-	strs := []*string{metricsPrometheusService, metricsQueryURL, metricsQueryBearerTokenFile, metricsScrapeManifest, metricsScrapeLabels}
+	strs := []*string{metricsPrometheusService, metricsQueryURL, metricsQueryBearerTokenFile, metricsQueryHeaders, metricsQueryCAFile, metricsScrapeManifest, metricsScrapeLabels}
 	oldStrs := make([]string, len(strs))
 	for i, p := range strs {
 		oldStrs[i] = *p
@@ -550,32 +637,41 @@ func setMetricsFlags(t *testing.T, promSvc, url, tokenFile, manifest, labels str
 		}
 		*metricsCollectionTimeout = oldTimeout
 	})
-	for i, v := range []string{promSvc, url, tokenFile, manifest, labels} {
-		*strs[i] = v
+	for i, s := range []string{v.promSvc, v.url, v.tokenFile, v.headers, v.caFile, v.manifest, v.labels} {
+		*strs[i] = s
 	}
-	*metricsCollectionTimeout = timeout
+	*metricsCollectionTimeout = v.timeout
 }
 
 func TestValidateMetricsFlags(t *testing.T) {
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const u = "https://prom.example"
 	tests := []struct {
-		name                                      string
-		promSvc, url, tokenFile, manifest, labels string
-		timeout                                   time.Duration
-		wantErr                                   string
+		name    string
+		flags   metricsFlagValues
+		wantErr string
 	}{
-		{name: "defaults", timeout: 5 * time.Minute},
-		{name: "service", promSvc: "monitoring/prometheus-operated:9090", labels: "release=kps", timeout: time.Minute},
-		{name: "url with token", url: "https://prom.example", tokenFile: "/token", timeout: time.Minute},
-		{name: "both endpoints", promSvc: "m/p:9090", url: "https://prom.example", timeout: time.Minute, wantErr: "mutually exclusive"},
-		{name: "token without url", promSvc: "m/p:9090", tokenFile: "/token", timeout: time.Minute, wantErr: "requires -service-metrics-query-url"},
-		{name: "token only", tokenFile: "/token", timeout: time.Minute, wantErr: "requires -service-metrics-query-url"},
-		{name: "zero timeout", promSvc: "m/p:9090", wantErr: "collection-timeout"},
-		{name: "missing manifest", promSvc: "m/p:9090", manifest: "does-not-exist.yaml", timeout: time.Minute, wantErr: "scrape-manifest"},
-		{name: "bad labels", promSvc: "m/p:9090", labels: "release", timeout: time.Minute, wantErr: "scrape-labels"},
+		{name: "defaults", flags: metricsFlagValues{timeout: 5 * time.Minute}},
+		{name: "service", flags: metricsFlagValues{promSvc: "monitoring/prometheus-operated:9090", labels: "release=kps", timeout: time.Minute}},
+		{name: "url with token", flags: metricsFlagValues{url: u, tokenFile: "/token", timeout: time.Minute}},
+		{name: "url with headers and ca", flags: metricsFlagValues{url: u, headers: "X-Scope-OrgID=tenant-a", caFile: caFile, timeout: time.Minute}},
+		{name: "both endpoints", flags: metricsFlagValues{promSvc: "m/p:9090", url: u, timeout: time.Minute}, wantErr: "mutually exclusive"},
+		{name: "token without url", flags: metricsFlagValues{promSvc: "m/p:9090", tokenFile: "/token", timeout: time.Minute}, wantErr: "bearer-token-file requires -service-metrics-query-url"},
+		{name: "token only", flags: metricsFlagValues{tokenFile: "/token", timeout: time.Minute}, wantErr: "requires -service-metrics-query-url"},
+		{name: "headers without url", flags: metricsFlagValues{promSvc: "m/p:9090", headers: "X-Scope-OrgID=a", timeout: time.Minute}, wantErr: "headers requires -service-metrics-query-url"},
+		{name: "ca without url", flags: metricsFlagValues{promSvc: "m/p:9090", caFile: caFile, timeout: time.Minute}, wantErr: "ca-file requires -service-metrics-query-url"},
+		{name: "bad headers", flags: metricsFlagValues{url: u, headers: "X-Scope-OrgID", timeout: time.Minute}, wantErr: "query-headers"},
+		{name: "missing ca file", flags: metricsFlagValues{url: u, caFile: "does-not-exist.pem", timeout: time.Minute}, wantErr: "query-ca-file"},
+		{name: "zero timeout", flags: metricsFlagValues{promSvc: "m/p:9090"}, wantErr: "collection-timeout"},
+		{name: "missing manifest", flags: metricsFlagValues{promSvc: "m/p:9090", manifest: "does-not-exist.yaml", timeout: time.Minute}, wantErr: "scrape-manifest"},
+		{name: "bad labels", flags: metricsFlagValues{promSvc: "m/p:9090", labels: "release", timeout: time.Minute}, wantErr: "scrape-labels"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			setMetricsFlags(t, tt.promSvc, tt.url, tt.tokenFile, tt.manifest, tt.labels, tt.timeout)
+			setMetricsFlags(t, tt.flags)
 			err := validateMetricsFlags()
 			if tt.wantErr == "" {
 				if err != nil {
@@ -591,7 +687,7 @@ func TestValidateMetricsFlags(t *testing.T) {
 }
 
 func TestApplyScrapeConfigServiceMonitor(t *testing.T) {
-	setMetricsFlags(t, "m/p:9090", "", "", "", "release=kube-prometheus-stack", time.Minute)
+	setMetricsFlags(t, metricsFlagValues{promSvc: "m/p:9090", labels: "release=kube-prometheus-stack", timeout: time.Minute})
 	client := fake.NewClientset()
 	client.Discovery().(*fakediscovery.FakeDiscovery).Resources = []*metav1.APIResourceList{{
 		GroupVersion: serviceMonitorGVR.GroupVersion().String(),
@@ -637,7 +733,7 @@ metadata:
 	if err := os.WriteFile(manifest, []byte(tmpl), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	setMetricsFlags(t, "m/p:9090", "", "", manifest, "", time.Minute)
+	setMetricsFlags(t, metricsFlagValues{promSvc: "m/p:9090", manifest: manifest, timeout: time.Minute})
 
 	podMonitoringGVR := schema.GroupVersionResource{Group: "monitoring.googleapis.com", Version: "v1", Resource: "podmonitorings"}
 	configMapGVR := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}

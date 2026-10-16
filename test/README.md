@@ -75,7 +75,7 @@ The metrics test deploys a small workload that exposes Prometheus metrics, sends
 The test is **skipped by default**. Point it at the monitoring system's Prometheus-compatible query API with exactly one of:
 
 - `-service-metrics-prometheus-service=<namespace>/<name>:<port>`: an in-cluster Service, reached through the API server service proxy (no port-forward needed).
-- `-service-metrics-query-url=<url>`: any reachable query endpoint, optionally with `-service-metrics-query-bearer-token-file`.
+- `-service-metrics-query-url=<url>`: any reachable query endpoint, including any path prefix (e.g. `https://mimir.example/prometheus`), optionally with `-service-metrics-query-bearer-token-file`, `-service-metrics-query-headers` (e.g. a tenant header like `X-Scope-OrgID=<tenant>`) and `-service-metrics-query-ca-file` for a private CA.
 
 By default the test creates a `monitoring.coreos.com/v1` `ServiceMonitor`. Use `-service-metrics-scrape-labels` if your Prometheus only selects labeled ServiceMonitors (for kube-prometheus-stack: `release=<helm release name>`). If your platform discovers scrape targets another way, pass a templated manifest with `-service-metrics-scrape-manifest`; run `go test ./test -args -help` for the available template fields. In a custom manifest, set the scrape interval to `{{.ScrapeInterval}}`. With a longer interval or ingestion delay, raise `-service-metrics-collection-timeout`, which bounds each of the two waits (before and after traffic).
 
