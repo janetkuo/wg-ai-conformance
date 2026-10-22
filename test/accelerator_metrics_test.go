@@ -37,19 +37,19 @@ var (
 )
 
 func init() {
-	registerFlagGroup("metrics", "Accelerator Performance Metrics Flags (TestAcceleratorPerformanceMetrics)")
-	metricsNamespace = flag.String("metrics-namespace", "",
+	registerFlagGroup("accelerator-metrics", "Accelerator Performance Metrics Flags (TestAcceleratorPerformanceMetrics)")
+	metricsNamespace = flag.String("accelerator-metrics-namespace", "",
 		"Namespace where the accelerator metrics exporter Service lives "+
 			"(e.g. gpu-operator). If empty, TestAcceleratorPerformanceMetrics is skipped.")
-	metricsServiceName = flag.String("metrics-service-name", "",
+	metricsServiceName = flag.String("accelerator-metrics-service-name", "",
 		"Name of the Kubernetes Service that fronts the accelerator metrics exporter "+
 			"(e.g. dcgm-exporter). If empty, TestAcceleratorPerformanceMetrics is skipped.")
-	metricsServicePort = flag.String("metrics-service-port", "9400",
+	metricsServicePort = flag.String("accelerator-metrics-service-port", "9400",
 		"Port (name or number) on the metrics exporter Service to proxy to.")
-	metricsUtilizationMetric = flag.String("metrics-utilization-metric", "",
+	metricsUtilizationMetric = flag.String("accelerator-metrics-utilization-metric", "",
 		"Exact Prometheus metric name for per-accelerator GPU utilization "+
 			"(e.g. DCGM_FI_DEV_GPU_UTIL). If empty, auto-detected by name pattern.")
-	metricsMemoryMetric = flag.String("metrics-memory-metric", "",
+	metricsMemoryMetric = flag.String("accelerator-metrics-memory-metric", "",
 		"Exact Prometheus metric name for per-accelerator memory usage "+
 			"(e.g. DCGM_FI_DEV_FB_USED). If empty, auto-detected by name pattern.")
 }
@@ -76,7 +76,7 @@ func TestAcceleratorPerformanceMetrics(t *testing.T) {
 		t.Skip("Skipping cluster E2E test in short mode")
 	}
 	if *metricsNamespace == "" || *metricsServiceName == "" {
-		t.Skip("accelerator metrics test is not configured; if the platform does not expose per-accelerator metrics, mark accelerator_metrics N/A, otherwise set -metrics-namespace=<namespace> -metrics-service-name=<name>")
+		t.Skip("accelerator metrics test is not configured; if the platform does not expose per-accelerator metrics, mark accelerator_metrics N/A, otherwise set -accelerator-metrics-namespace=<namespace> -accelerator-metrics-service-name=<name>")
 	}
 
 	ctx := context.Background()

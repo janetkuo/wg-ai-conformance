@@ -25,7 +25,7 @@ helm repo update
 
 # runtimeClassName=nvidia: required for the exporter to see GPUs on nvkind, where
 # the NVIDIA runtime is only configured on GPU nodes via the nvidia RuntimeClass.
-# tolerations={}: clears the chart's default control-plane tolerations so the
+# tolerations=[]: clears the chart's default control-plane tolerations so the
 # DaemonSet only lands on worker GPU nodes.
 helm upgrade -i dcgm-exporter gpu-helm-charts/dcgm-exporter \
     --namespace "${DCGM_EXPORTER_NAMESPACE}" \
@@ -37,7 +37,7 @@ helm upgrade -i dcgm-exporter gpu-helm-charts/dcgm-exporter \
     --wait --timeout 10m
 
 printf '%s\n' \
-    "-metrics-namespace=${DCGM_EXPORTER_NAMESPACE}" \
-    "-metrics-service-name=dcgm-exporter" \
+    "-accelerator-metrics-namespace=${DCGM_EXPORTER_NAMESPACE}" \
+    "-accelerator-metrics-service-name=dcgm-exporter" \
     >> "${E2E_TEST_ARGS_FILE}"
 echo "DCGM Exporter ready; metrics test will run"
