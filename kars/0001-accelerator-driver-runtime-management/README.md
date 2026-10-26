@@ -22,8 +22,8 @@ By providing a verifiable mechanism to ensure compatibility, platforms can signi
 
 **MUST**
 - [x] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
-- [ ] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
-- [ ] Kubernetes core APIs must be GA
+- [x] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
+- [x] Kubernetes core APIs must be GA
 
 ## Test Plan
 
@@ -42,7 +42,9 @@ The automated conformance test (`TestAcceleratorDriverRuntimeManagement` in `tes
 
 2025-11-19: KAR created
 
-2026-09-22: `TestAcceleratorDriverRuntimeManagement` added to the AI conformance test suite
+2026-10-24: `TestAcceleratorDriverRuntimeManagement` added to the AI conformance test suite
+
+2026-10-26: Graduated to MUST, targeting v1.38
 
 ## Related KARs
 
