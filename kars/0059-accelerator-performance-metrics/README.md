@@ -35,10 +35,6 @@ The test verifies that an accelerator metrics solution running on the platform e
 
 2. **Metrics presence case**: Scrape the metrics endpoint and verify that the response includes per-accelerator metrics for utilization and memory usage. Where the underlying hardware supports it, additional metrics for temperature, power draw, and interconnect bandwidth should also be present.
 
-3. **Workload-driven case**: Schedule a workload that exercises the accelerator (e.g., a short compute task). Scrape the endpoint before and during the workload, and verify that the utilization metric reflects the change.
-
-4. **Cleanup**: Delete the test workload.
-
 ## Implementation History
 
 2026-03-12: KAR created

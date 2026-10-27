@@ -194,15 +194,6 @@ func testOperatorPodsRunning(ctx context.Context, t *testing.T, clientset kubern
 	t.Logf("PASS: %d operator pod(s) are Ready in namespace %s", lastPodCount, op.namespace)
 }
 
-func podIsReady(pod *corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
 func testCRDRegistered(ctx context.Context, t *testing.T, dynamicClient dynamic.Interface, op operatorDef) {
 	t.Helper()
 	t.Logf("Verifying CRD %s is registered and Established...", op.crdName)
