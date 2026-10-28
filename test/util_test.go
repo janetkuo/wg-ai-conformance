@@ -346,6 +346,26 @@ func nodeIsReady(node *corev1.Node) bool {
 	return ready != nil && ready.Status == corev1.ConditionTrue
 }
 
+func podIsReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func podUnschedulable(pod *corev1.Pod) (bool, string) {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled &&
+			condition.Status == corev1.ConditionFalse &&
+			condition.Reason == corev1.PodReasonUnschedulable {
+			return true, condition.Message
+		}
+	}
+	return false, ""
+}
+
 // checkDRAUsable verifies that DRA is usable for the accelerator under test:
 // the DeviceClass exists and at least one ResourceSlice from the configured
 // driver advertises devices reachable from a Ready, schedulable node. It
